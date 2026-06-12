@@ -259,8 +259,20 @@ impl<T: DeserializeOwned> TableScan<T> {
                     return Ok(None);
                 }
                 let s = &self.slices[self.idx];
-                self.current = Some(SegmentReader::open_bounded(&s.path, s.bound)?);
                 self.idx += 1;
+                // a slice may have been unlinked by retention between the
+                // snapshot and this scan — the rows were past the retention
+                // window anyway, so a vanished segment is "aged out", not an
+                // error (concurrent retention + query must not fail reads)
+                self.current = match SegmentReader::open_bounded(&s.path, s.bound) {
+                    Ok(r) => Some(r),
+                    Err(crate::error::Error::Io(e))
+                        if e.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
             }
             if let Some((_, payload)) = self.current.as_mut().unwrap().next_record()? {
                 return Ok(Some(bincode::deserialize(&payload)?));
@@ -319,5 +331,36 @@ mod tests {
         assert!(remaining.len() < 50);
         // newest rows survive (active segment is never purged)
         assert_eq!(remaining.last().unwrap().msg, "row-49");
+    }
+
+    /// Retention can unlink a sealed segment between a snapshot and the scan
+    /// that uses it; the scan must treat the vanished file as aged-out data,
+    /// not fail the whole query.
+    #[test]
+    fn scan_skips_segments_purged_after_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t: Table<Row> = Table::open(dir.path(), 256).unwrap();
+        for i in 0..50u64 {
+            t.append(
+                &Row {
+                    ts: i,
+                    msg: format!("row-{i}"),
+                },
+                i,
+            )
+            .unwrap();
+        }
+        t.sync().unwrap();
+        let slices = t.slices().unwrap();
+        assert!(slices.len() > 2, "need several segments for this test");
+
+        // "retention" unlinks the first sealed segment after the snapshot
+        std::fs::remove_file(&slices[0].path).unwrap();
+
+        let rows: Vec<Row> = TableScan::<Row>::over(slices)
+            .collect::<Result<Vec<_>>>()
+            .expect("scan must not fail on a purged segment");
+        assert!(!rows.is_empty() && rows.len() < 50);
+        assert_eq!(rows.last().unwrap().msg, "row-49");
     }
 }
