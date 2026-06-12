@@ -1,0 +1,59 @@
+name: nightly
+
+# Long adversarial runs that are too slow for every PR: extended fuzzing,
+# the concurrency stress suite and crash injection. The short per-PR smoke
+# versions live in ci.yml.
+on:
+  schedule:
+    - cron: "0 18 * * *" # 03:00 KST
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-long:
+    name: fuzz (10 min per target)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [segment_reader, dlq_redrive]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=600 -rss_limit_mb=4096
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+
+  stress:
+    name: concurrency stress (2 min)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p quipu-middleware --release --test stress -- --ignored --nocapture
+        env:
+          QUIPU_STRESS_SECS: "120"
+
+  crash-injection:
+    name: crash injection (30 kills)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p quipu-middleware --release --test crash -- --ignored --exact crash_kill_recover_verify --nocapture
+        env:
+          QUIPU_CRASH_ITERS: "30"
