@@ -1,10 +1,10 @@
-# quipu
+# Quipu-Log
 
 A quipu is the knotted-cord device the Incas used to keep records: knots tied
 along a chain of cords, where you can't quietly retie one without it showing.
 That's a pretty good picture of what this library does for your API.
 
-quipu is an embedded audit log for Rust services. It records *who did what to
+Quipu-Log is an embedded audit log for Rust services. It records *who did what to
 which entities through which API*, and lets you query it back later — including
 by attribute values the entities had **at the time**. If a patient was renamed
 last month, logs written before the rename still render the old name, and you
