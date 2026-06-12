@@ -941,6 +941,7 @@ name = "quipu-middleware"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bincode",
  "bytes",
  "http",
  "http-body",

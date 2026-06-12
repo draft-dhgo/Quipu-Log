@@ -174,7 +174,7 @@ Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (latest versions) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (oldest first) |
 | `POST /v1/admin/flush` | administer | fsync everything queued → 204 |
-| `POST /v1/admin/redrive` | administer | `{"redriven": n}` |
+| `POST /v1/admin/redrive` | administer | `{"redriven": n, "requeued": n, "quarantined_entries": n, "quarantined_segments": n}` — corrupt DLQ material is moved to `<dlq>.quarantine/` instead of failing the redrive |
 | `POST /v1/admin/retention` | administer | `{"segments_dropped": n}` |
 | `GET /v1/admin/dlq` | administer | `{"parked": n}` |
 | `POST /v1/admin/verify` | administer | verify report (below); **409** while another verification runs |

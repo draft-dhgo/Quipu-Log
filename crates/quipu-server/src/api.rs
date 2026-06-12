@@ -394,8 +394,13 @@ async fn admin_redrive(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let role = state.authorize(&headers, Action::Administer)?.role;
     let handle = state.handle.clone();
-    let n = blocking(move || handle.redrive_dlq(&role)).await?;
-    Ok(Json(serde_json::json!({ "redriven": n })))
+    let report = blocking(move || handle.redrive_dlq(&role)).await?;
+    Ok(Json(serde_json::json!({
+        "redriven": report.replayed,
+        "requeued": report.requeued,
+        "quarantined_entries": report.quarantined_entries,
+        "quarantined_segments": report.quarantined_segments,
+    })))
 }
 
 async fn admin_retention(

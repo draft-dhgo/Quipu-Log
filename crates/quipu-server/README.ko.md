@@ -182,7 +182,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (최신 버전) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (오래된 것부터) |
 | `POST /v1/admin/flush` | administer | 큐에 쌓인 것 전부 fsync → 204 |
-| `POST /v1/admin/redrive` | administer | `{"redriven": n}` |
+| `POST /v1/admin/redrive` | administer | `{"redriven": n, "requeued": n, "quarantined_entries": n, "quarantined_segments": n}` — 손상된 DLQ 데이터는 redrive를 실패시키는 대신 `<dlq>.quarantine/`으로 격리 |
 | `POST /v1/admin/retention` | administer | `{"segments_dropped": n}` |
 | `GET /v1/admin/dlq` | administer | `{"parked": n}` |
 | `POST /v1/admin/verify` | administer | 검증 리포트(아래 참고). 이미 돌고 있으면 **409** |

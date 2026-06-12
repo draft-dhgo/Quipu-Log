@@ -21,5 +21,6 @@ pub use filter::{FilterDecision, FilterSet, PostFilter, PreFilter, RequestInfo, 
 pub use layer::{ActorExtractor, AuditLayer, AuditService, EndpointRule, TargetExtractor};
 pub use permissions::{Action, PermissionPolicy, Role};
 pub use pipeline::{
-    AuditHandle, AuditPipeline, DlqEntry, FallbackFn, MiddlewareError, PipelineConfig, VerifyReport,
+    AuditHandle, AuditPipeline, DlqEntry, FallbackFn, MiddlewareError, PipelineConfig,
+    RedriveReport, VerifyReport,
 };
