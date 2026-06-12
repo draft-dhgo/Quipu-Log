@@ -3,11 +3,11 @@ use crate::crypto::KeyRing;
 use crate::error::{Error, Result};
 use crate::id::Uid;
 use crate::model::{AuditLog, Content, TargetRelation, Value};
-use crate::query::{LogQuery, LogView, TargetFilter, TargetSnapshot};
+use crate::query::{LogQuery, LogView, Order, QueryPage, TargetFilter, TargetSnapshot};
 use crate::registry::{EntityInput, RegistryIndex, RegistryRecord, TypeRegistry};
 use crate::retention::RetentionPolicy;
 use crate::schema::{CustomColumnDef, TypeSchema};
-use crate::storage::{SegmentSlice, Table, TableScan};
+use crate::storage::{Position, PositionedScan, SegmentSlice, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -678,6 +678,18 @@ impl AuditStore {
         self.snapshot()?.query(q)
     }
 
+    /// Run a query and get one page plus a continuation cursor. Convenience
+    /// for [`snapshot`](Self::snapshot)`()?.query_page(q)`.
+    pub fn query_page(&mut self, q: &LogQuery) -> Result<QueryPage> {
+        self.snapshot()?.query_page(q)
+    }
+
+    /// Count a query's matches without rendering them. Convenience for
+    /// [`snapshot`](Self::snapshot)`()?.count(q)`.
+    pub fn count(&mut self, q: &LogQuery) -> Result<u64> {
+        self.snapshot()?.count(q)
+    }
+
     /// Decrypt an RSA-protected stored value (requires the private key).
     pub fn decrypt(&self, v: &crate::model::StoredValue) -> Result<Vec<u8>> {
         self.cfg.keys.decrypt(v)
@@ -721,15 +733,133 @@ pub struct ReadSnapshot {
     relations: Vec<SegmentSlice>,
 }
 
+/// The per-query filter state shared by [`ReadSnapshot::query_page`] and
+/// [`ReadSnapshot::count`]: registry filters resolved to uid sets once, so
+/// the log scan itself is pure set/field checks per row.
+struct ResolvedFilters {
+    allowed_by_target: Option<HashSet<Uid>>,
+    allowed_actor_uids: Option<HashSet<Uid>>,
+}
+
+impl ResolvedFilters {
+    fn matches(&self, q: &LogQuery, log: &AuditLog) -> bool {
+        // from/to are not re-checked here: the positioned scan already
+        // filtered on the frame-header timestamp before deserializing
+        if let Some(m) = &q.method {
+            if !log.method.eq_ignore_ascii_case(m) {
+                return false;
+            }
+        }
+        if let Some(p) = &q.url_prefix {
+            if !log.url.starts_with(p.as_str()) {
+                return false;
+            }
+        }
+        if let Some(allowed) = &self.allowed_by_target {
+            if !allowed.contains(&log.log_id) {
+                return false;
+            }
+        }
+        if let Some(uids) = &self.allowed_actor_uids {
+            if !uids.contains(&log.actor) {
+                return false;
+            }
+        }
+        q.custom.iter().all(|(k, v)| log.custom.get(k) == Some(v))
+    }
+}
+
 impl ReadSnapshot {
-    /// Run a query against this snapshot. `&mut self` because Contains
-    /// searches lazily decrypt-and-cache RSA values.
+    /// Run a query against this snapshot and return the matches of the first
+    /// page (see [`query_page`](Self::query_page) for the cursor). `&mut
+    /// self` because Contains searches lazily decrypt-and-cache RSA values.
     pub fn query(&mut self, q: &LogQuery) -> Result<Vec<LogView>> {
-        // 1. resolve entity filters to allowed log_id sets via the relation
-        //    table; multiple target filters intersect (AND)
+        Ok(self.query_page(q)?.logs)
+    }
+
+    /// Run a query and return one page plus a continuation cursor.
+    ///
+    /// Scan cost is bounded three ways:
+    /// - log segments entirely outside `from_micros..=to_micros` are never
+    ///   opened (per-segment time bounds live in the snapshot),
+    /// - the scan walks in `q.order` and stops at `limit` matches, so a
+    ///   newest-first page over a long history reads only the newest data,
+    /// - relations are resolved only for the page's hits (never a whole-table
+    ///   relation map in memory).
+    pub fn query_page(&mut self, q: &LogQuery) -> Result<QueryPage> {
+        let filters = self.resolve_filters(q)?;
+        let mut scan = self.log_scan(q)?;
+        let mut hits: Vec<(Position, AuditLog)> = Vec::new();
+        let mut more = false;
+        while let Some((pos, log)) = scan.next_row()? {
+            if !filters.matches(q, &log) {
+                continue;
+            }
+            if q.limit.is_some_and(|limit| hits.len() >= limit) {
+                // a (limit+1)-th match exists, so the cursor is worth issuing
+                more = true;
+                break;
+            }
+            hits.push((pos, log));
+        }
+        let next_cursor = match (more, hits.last()) {
+            (true, Some((pos, _))) => Some(crate::query::encode_cursor(q.order, *pos)),
+            _ => None,
+        };
+
+        // resolve relations for the page's hits only; relation rows carry
+        // their log's timestamp, so the same time window prunes here too
+        let wanted: HashSet<Uid> = hits.iter().map(|(_, log)| log.log_id).collect();
+        let mut rels_by_log: HashMap<Uid, Vec<TargetRelation>> = HashMap::new();
+        if !wanted.is_empty() {
+            let mut rels: PositionedScan<TargetRelation> = PositionedScan::new(
+                self.relations.clone(),
+                false,
+                q.from_micros,
+                q.to_micros,
+                None,
+            );
+            while let Some((_, rel)) = rels.next_row()? {
+                if wanted.contains(&rel.log_id) {
+                    rels_by_log.entry(rel.log_id).or_default().push(rel);
+                }
+            }
+        }
+        Ok(QueryPage {
+            logs: hits
+                .into_iter()
+                .map(|(_, log)| self.render(log, &rels_by_log))
+                .collect(),
+            next_cursor,
+            segments_scanned: scan.segments_opened(),
+        })
+    }
+
+    /// Count the query's matches without rendering them: no registry
+    /// resolution, no relation lookup per hit, no decryption — just the
+    /// pruned log scan and per-row filter checks. `limit` and `cursor` are
+    /// ignored: the count is the total for the filters.
+    pub fn count(&mut self, q: &LogQuery) -> Result<u64> {
+        let filters = self.resolve_filters(q)?;
+        let mut q = q.clone();
+        q.cursor = None;
+        q.order = Order::Asc; // cheapest direction; order is irrelevant to a count
+        let mut scan = self.log_scan(&q)?;
+        let mut n = 0u64;
+        while let Some((_, log)) = scan.next_row()? {
+            if filters.matches(&q, &log) {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Resolve registry-side filters (targets, actor) to uid sets. Multiple
+    /// target filters intersect (AND).
+    fn resolve_filters(&mut self, q: &LogQuery) -> Result<ResolvedFilters> {
         let mut allowed_by_target: Option<HashSet<Uid>> = None;
         for f in &q.targets {
-            let ids = self.log_ids_for_filter(f)?;
+            let ids = self.log_ids_for_filter(f, q.from_micros, q.to_micros)?;
             allowed_by_target = Some(match allowed_by_target {
                 Some(prev) => prev.intersection(&ids).copied().collect(),
                 None => ids,
@@ -739,69 +869,43 @@ impl ReadSnapshot {
             Some(f) => Some(self.version_uids_for_filter(f)?),
             None => None,
         };
+        Ok(ResolvedFilters {
+            allowed_by_target,
+            allowed_actor_uids,
+        })
+    }
 
-        // 2. group relations per log so each hit can render its targets
-        let mut rels_by_log: HashMap<Uid, Vec<TargetRelation>> = HashMap::new();
-        for rel in TableScan::<TargetRelation>::over(self.relations.clone()) {
-            let rel = rel?;
-            rels_by_log.entry(rel.log_id).or_default().push(rel);
-        }
-
-        // 3. stream the log table and apply all conditions
-        let mut hits = Vec::new();
-        for row in TableScan::<AuditLog>::over(self.logs.clone()) {
-            let log = row?;
-            if let Some(from) = q.from_micros {
-                if log.timestamp < from {
-                    continue;
-                }
-            }
-            if let Some(to) = q.to_micros {
-                if log.timestamp > to {
-                    continue;
-                }
-            }
-            if let Some(m) = &q.method {
-                if !log.method.eq_ignore_ascii_case(m) {
-                    continue;
-                }
-            }
-            if let Some(p) = &q.url_prefix {
-                if !log.url.starts_with(p.as_str()) {
-                    continue;
-                }
-            }
-            if let Some(allowed) = &allowed_by_target {
-                if !allowed.contains(&log.log_id) {
-                    continue;
-                }
-            }
-            if let Some(uids) = &allowed_actor_uids {
-                if !uids.contains(&log.actor) {
-                    continue;
-                }
-            }
-            if !q.custom.iter().all(|(k, v)| log.custom.get(k) == Some(v)) {
-                continue;
-            }
-            hits.push(self.render(log, &rels_by_log));
-            if let Some(limit) = q.limit {
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(hits)
+    /// The time/cursor-bounded log scan for a query.
+    fn log_scan(&self, q: &LogQuery) -> Result<PositionedScan<AuditLog>> {
+        let after = match &q.cursor {
+            Some(c) => Some(crate::query::decode_cursor(c, q.order)?),
+            None => None,
+        };
+        Ok(PositionedScan::new(
+            self.logs.clone(),
+            q.order == Order::Desc,
+            q.from_micros,
+            q.to_micros,
+            after,
+        ))
     }
 
     /// All log_ids whose relations point at an entity matching the filter.
     /// Matching is by *entity*, not version: searching the current name also
-    /// finds logs recorded under an older name, and vice versa.
-    fn log_ids_for_filter(&mut self, f: &TargetFilter) -> Result<HashSet<Uid>> {
+    /// finds logs recorded under an older name, and vice versa. The relation
+    /// scan is time-pruned: a relation row carries its log's timestamp, so
+    /// logs outside the window cannot enter the set anyway.
+    fn log_ids_for_filter(
+        &mut self,
+        f: &TargetFilter,
+        from: Option<u64>,
+        to: Option<u64>,
+    ) -> Result<HashSet<Uid>> {
         let version_uids = self.version_uids_for_filter(f)?;
         let mut out = HashSet::new();
-        for rel in TableScan::<TargetRelation>::over(self.relations.clone()) {
-            let rel = rel?;
+        let mut rels: PositionedScan<TargetRelation> =
+            PositionedScan::new(self.relations.clone(), false, from, to, None);
+        while let Some((_, rel)) = rels.next_row()? {
             if version_uids.contains(&rel.entity_registry_uid) {
                 out.insert(rel.log_id);
             }

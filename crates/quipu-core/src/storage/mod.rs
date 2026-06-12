@@ -21,4 +21,4 @@ mod segment;
 mod table;
 
 pub use segment::{ChainHash, Segment, SegmentReader};
-pub use table::{SegmentSlice, Table, TableScan};
+pub use table::{Position, PositionedScan, SegmentSlice, Table, TableScan};

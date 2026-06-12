@@ -31,7 +31,7 @@ pub use crypto::KeyRing;
 pub use error::{Error, Result};
 pub use id::Uid;
 pub use model::{AuditLog, Content, StoredValue, TargetRelation, Value, ValueKind};
-pub use query::{LogQuery, LogView, MatchMode, TargetFilter, TargetSnapshot};
+pub use query::{LogQuery, LogView, MatchMode, Order, QueryPage, TargetFilter, TargetSnapshot};
 pub use registry::EntityInput;
 pub use retention::RetentionPolicy;
 pub use schema::{

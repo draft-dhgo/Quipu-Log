@@ -69,13 +69,14 @@ fn rename_keeps_history_searchable_both_ways() {
     assert_eq!(current.len(), 2);
     assert_eq!(past.len(), 2);
 
-    // but each log renders the name as it was at record time
+    // but each log renders the name as it was at record time (results are
+    // newest-first by default)
     let name_of = |v: &LogView| match v.targets[0].fields.get("name").unwrap() {
         StoredValue::Plain(Value::Text(s)) => s.clone(),
         other => panic!("unexpected {other:?}"),
     };
-    assert_eq!(name_of(&current[0]), "draft");
-    assert_eq!(name_of(&current[1]), "final-report");
+    assert_eq!(name_of(&current[0]), "final-report");
+    assert_eq!(name_of(&current[1]), "draft");
 
     // unrelated name finds nothing
     assert!(by(&mut store, "nope").is_empty());

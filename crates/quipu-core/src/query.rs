@@ -1,5 +1,9 @@
+use crate::error::{Error, Result};
 use crate::id::Uid;
 use crate::model::{Content, StoredValue, Value};
+use crate::storage::Position;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -85,6 +89,19 @@ impl TargetFilter {
     }
 }
 
+/// Result order of a log query, by record append position (which is also
+/// arrival order — within one store, positions grow monotonically).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Order {
+    /// Oldest first.
+    Asc,
+    /// Newest first — the audit-UI default ("what just happened?"), and the
+    /// order under which `limit` means "the latest N".
+    #[default]
+    Desc,
+}
+
 /// Declarative log query. All set conditions are AND-ed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -102,7 +119,72 @@ pub struct LogQuery {
     pub targets: Vec<TargetFilter>,
     /// Custom-column equality conditions.
     pub custom: BTreeMap<String, Value>,
+    /// Page size. With [`Order::Desc`] (the default) this means "the latest
+    /// N matches"; the page's `next_cursor` continues into older records.
     pub limit: Option<usize>,
+    /// Scan/result order. Defaults to newest-first.
+    pub order: Order,
+    /// Opaque continuation token from a previous page's
+    /// [`QueryPage::next_cursor`]. The rest of the query (filters, order)
+    /// must stay identical between pages — the cursor only encodes *where*
+    /// the previous page stopped, not *what* it matched.
+    pub cursor: Option<String>,
+}
+
+/// One page of query results (see [`crate::ReadSnapshot::query_page`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryPage {
+    pub logs: Vec<LogView>,
+    /// Present when more matches remain past this page; feed it back via
+    /// [`LogQuery::cursor`] to continue. `None` on the final page.
+    pub next_cursor: Option<String>,
+    /// Log segment files this query actually opened — observability for
+    /// time-range pruning (a narrow window over a long history should open
+    /// far fewer segments than the table holds).
+    pub segments_scanned: u64,
+}
+
+/// Cursor wire format (before base64): version byte, order byte, then the
+/// little-endian (segment seq, record idx) position of the last record the
+/// previous page returned. Positions are physical and append-only, so a
+/// cursor stays valid across snapshots: records appended after it sort
+/// strictly after (asc) / before-it-was-issued pages are unaffected (desc),
+/// and retention only removes whole old segments, which scans skip.
+const CURSOR_V1: u8 = 1;
+const CURSOR_LEN: usize = 1 + 1 + 8 + 8;
+
+pub(crate) fn encode_cursor(order: Order, pos: Position) -> String {
+    let mut b = [0u8; CURSOR_LEN];
+    b[0] = CURSOR_V1;
+    b[1] = (order == Order::Desc) as u8;
+    b[2..10].copy_from_slice(&pos.seq.to_le_bytes());
+    b[10..18].copy_from_slice(&pos.idx.to_le_bytes());
+    URL_SAFE_NO_PAD.encode(b)
+}
+
+pub(crate) fn decode_cursor(cursor: &str, order: Order) -> Result<Position> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| Error::InvalidCursor("not a query cursor".into()))?;
+    let b: [u8; CURSOR_LEN] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidCursor("not a query cursor".into()))?;
+    if b[0] != CURSOR_V1 {
+        return Err(Error::InvalidCursor(format!(
+            "unsupported cursor version {}",
+            b[0]
+        )));
+    }
+    let cursor_desc = b[1] != 0;
+    if cursor_desc != (order == Order::Desc) {
+        return Err(Error::InvalidCursor(
+            "cursor was issued under the opposite sort order".into(),
+        ));
+    }
+    Ok(Position {
+        seq: u64::from_le_bytes(b[2..10].try_into().unwrap()),
+        idx: u64::from_le_bytes(b[10..18].try_into().unwrap()),
+    })
 }
 
 /// Snapshot of one entity exactly as it was when the log was written.
