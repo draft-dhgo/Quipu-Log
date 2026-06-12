@@ -720,3 +720,236 @@ fn snapshot_queries_are_isolated_from_later_writes() {
     assert_eq!(snap.query(&LogQuery::default()).unwrap().len(), 1);
     assert_eq!(store.query(&LogQuery::default()).unwrap().len(), 2);
 }
+
+#[test]
+fn ngram_index_searches_hashed_fields_without_plaintext_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        // no plaintext cache, no RSA keys — just the HMAC key
+        let cfg = StoreConfig::new(dir.path())
+            .keys(KeyRing::new().with_hmac_key(b"k1"))
+            .sync_policy(SyncPolicy::OsManaged);
+        AuditStore::open(cfg).unwrap()
+    };
+    let mut store = open();
+    store.define_type(default_actor_type()).unwrap();
+    store
+        .define_type(TypeSchema::new(
+            "patient",
+            vec![FieldDef::text("ssn")
+                .protection(FieldProtection::Hmac)
+                .search(FieldIndex::Ngram(3))],
+        ))
+        .unwrap();
+    let patient = EntityInput::new("p-1").text("ssn", "123-45-6789");
+    store
+        .append(
+            "default_actor",
+            &alice(),
+            "GET",
+            "/api/patients/p-1",
+            Content::Text("".into()),
+            &[("patient".into(), patient)],
+            BTreeMap::new(),
+        )
+        .unwrap();
+    store.sync().unwrap();
+
+    let q = |probe: &str| LogQuery {
+        targets: vec![TargetFilter::exact("patient", "ssn", Value::Text(probe.into())).contains()],
+        ..Default::default()
+    };
+
+    // substring search on a one-way hashed field, with the plaintext cache
+    // off — possible because the token digests are persisted at write time
+    assert_eq!(store.query(&q("45-67")).unwrap().len(), 1);
+    assert!(store.query(&q("99-99")).unwrap().is_empty());
+
+    // and it survives a restart (unlike the held-plaintext fallback)
+    drop(store);
+    let mut store = open();
+    assert_eq!(store.query(&q("45-67")).unwrap().len(), 1);
+
+    // probes shorter than n cannot use the index; the fallback scan needs
+    // the plaintext cache, so this is rejected with a pointer to the fix
+    let err = store.query(&q("45")).unwrap_err();
+    assert!(err.to_string().contains("plaintext cache"), "{err}");
+}
+
+#[test]
+fn prefix_and_exact_ci_indexes_on_hashed_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StoreConfig::new(dir.path())
+        .keys(KeyRing::new().with_hmac_key(b"k1"))
+        .sync_policy(SyncPolicy::OsManaged);
+    let mut store = AuditStore::open(cfg).unwrap();
+    store.define_type(default_actor_type()).unwrap();
+    store
+        .define_type(TypeSchema::new(
+            "customer",
+            vec![
+                FieldDef::text("name")
+                    .protection(FieldProtection::Hmac)
+                    .search(FieldIndex::Prefix(4)),
+                FieldDef::text("email")
+                    .protection(FieldProtection::Hmac)
+                    .search(FieldIndex::Exact),
+            ],
+        ))
+        .unwrap();
+    let log_for = |store: &mut AuditStore, input: EntityInput| {
+        store
+            .append(
+                "default_actor",
+                &alice(),
+                "PUT",
+                "/api/customers",
+                Content::Text("".into()),
+                &[("customer".into(), input)],
+                BTreeMap::new(),
+            )
+            .unwrap();
+    };
+    log_for(
+        &mut store,
+        EntityInput::new("c-1")
+            .text("name", "Carol")
+            .text("email", "Carol@Example.com"),
+    );
+
+    let prefix =
+        |probe: &str| TargetFilter::exact("customer", "name", Value::Text(probe.into())).prefix();
+    let q = |f: TargetFilter| LogQuery {
+        targets: vec![f],
+        ..Default::default()
+    };
+
+    // prefix probes up to the declared depth, case-insensitive, no false hits
+    assert_eq!(store.query(&q(prefix("Car"))).unwrap().len(), 1);
+    assert_eq!(store.query(&q(prefix("caro"))).unwrap().len(), 1);
+    assert!(store.query(&q(prefix("aro"))).unwrap().is_empty());
+    // longer than the depth -> fallback scan -> needs the plaintext cache
+    assert!(store
+        .query(&q(prefix("carol")))
+        .unwrap_err()
+        .to_string()
+        .contains("plaintext cache"));
+
+    // case-insensitive exact via the Exact token
+    let ci = |probe: &str| {
+        TargetFilter::exact("customer", "email", Value::Text(probe.into())).exact_ci()
+    };
+    assert_eq!(store.query(&q(ci("carol@example.com"))).unwrap().len(), 1);
+    assert_eq!(store.query(&q(ci("CAROL@EXAMPLE.COM"))).unwrap().len(), 1);
+    assert!(store.query(&q(ci("carol@example"))).unwrap().is_empty());
+
+    // rename: include_past still finds the old prefix, latest_only does not
+    log_for(
+        &mut store,
+        EntityInput::new("c-1")
+            .text("name", "Dave")
+            .text("email", "Carol@Example.com"),
+    );
+    assert_eq!(store.query(&q(prefix("car"))).unwrap().len(), 2);
+    assert!(store
+        .query(&q(prefix("car").latest_only()))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.query(&q(prefix("dav").latest_only())).unwrap().len(),
+        2,
+        "matching the entity finds all its logs"
+    );
+}
+
+#[test]
+fn ngram_candidates_are_verified_for_rsa_but_not_for_hashed_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StoreConfig::new(dir.path())
+        .keys(KeyRing::generate_ephemeral(2048).unwrap())
+        .plaintext_cache(true)
+        .sync_policy(SyncPolicy::OsManaged);
+    let mut store = AuditStore::open(cfg).unwrap();
+    store.define_type(default_actor_type()).unwrap();
+    store
+        .define_type(TypeSchema::new(
+            "doc",
+            vec![
+                FieldDef::text("note")
+                    .protection(FieldProtection::Rsa)
+                    .search(FieldIndex::Ngram(3)),
+                FieldDef::text("tag")
+                    .protection(FieldProtection::Hmac)
+                    .search(FieldIndex::Ngram(3)),
+            ],
+        ))
+        .unwrap();
+    // "abcd-cdef" carries every trigram of "abcdef" (abc, bcd, cde, def)
+    // without containing it — a deliberate false-positive candidate
+    for (id, text) in [("d-1", "abcd-cdef"), ("d-2", "abcdef")] {
+        store
+            .append(
+                "default_actor",
+                &alice(),
+                "PUT",
+                "/api/docs",
+                Content::Text("".into()),
+                &[(
+                    "doc".into(),
+                    EntityInput::new(id).text("note", text).text("tag", text),
+                )],
+                BTreeMap::new(),
+            )
+            .unwrap();
+    }
+    let q = |field: &str| LogQuery {
+        targets: vec![TargetFilter::exact("doc", field, Value::Text("abcdef".into())).contains()],
+        ..Default::default()
+    };
+    // RSA: candidates are decrypted and verified -> only the real substring
+    assert_eq!(store.query(&q("note")).unwrap().len(), 1);
+    // one-way hashed: candidates cannot be verified -> the false positive
+    // is included (documented FieldIndex::Ngram trade-off)
+    assert_eq!(store.query(&q("tag")).unwrap().len(), 2);
+}
+
+#[test]
+fn field_index_schema_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = open_store(dir.path());
+
+    // token indexes are text-only
+    let err = store
+        .define_type(TypeSchema::new(
+            "t1",
+            vec![FieldDef::text("n")
+                .kind(ValueKind::Number)
+                .search(FieldIndex::Ngram(3))],
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("Text"), "{err}");
+
+    // zero-sized indexes are rejected
+    let err = store
+        .define_type(TypeSchema::new(
+            "t2",
+            vec![FieldDef::text("n").search(FieldIndex::Prefix(0))],
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains(">= 1"), "{err}");
+
+    // changing a field's index would silently orphan old records' tokens
+    store
+        .define_type(TypeSchema::new(
+            "t3",
+            vec![FieldDef::text("n").search(FieldIndex::Ngram(3))],
+        ))
+        .unwrap();
+    let err = store
+        .define_type(TypeSchema::new(
+            "t3",
+            vec![FieldDef::text("n").search(FieldIndex::Ngram(4))],
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("FieldIndex"), "{err}");
+}

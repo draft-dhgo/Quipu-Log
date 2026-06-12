@@ -132,6 +132,31 @@ impl KeyRing {
         Ok(hex(&mac.finalize().into_bytes()))
     }
 
+    /// Digest of one blind-index token ([`crate::schema::FieldIndex`]).
+    ///
+    /// The input is domain-separated (`"idx:" + field + NUL + token`) so an
+    /// index digest can never collide with — or be replayed as — the field's
+    /// own stored digest. The digest function follows the field's protection:
+    /// keyless protections (None/Sha256) use SHA-256, keyed ones (Hmac/Rsa)
+    /// use the HMAC key, so the tokens of an encrypted field cannot be
+    /// brute-forced offline any more than the field itself.
+    pub fn index_token_digest(
+        &self,
+        field: &str,
+        protection: FieldProtection,
+        token: &str,
+    ) -> Result<String> {
+        let mut data = Vec::with_capacity(4 + field.len() + 1 + token.len());
+        data.extend_from_slice(b"idx:");
+        data.extend_from_slice(field.as_bytes());
+        data.push(0);
+        data.extend_from_slice(token.as_bytes());
+        match protection {
+            FieldProtection::None | FieldProtection::Sha256 => Ok(sha256_hex(&data)),
+            FieldProtection::Hmac | FieldProtection::Rsa => self.hmac_hex(&data),
+        }
+    }
+
     /// Apply a schema-declared protection to a plain value.
     pub fn protect(&self, value: &Value, protection: FieldProtection) -> Result<StoredValue> {
         match protection {

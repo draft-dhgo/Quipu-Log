@@ -1,10 +1,11 @@
 use crate::crypto::{sha256_hex, KeyRing};
 use crate::error::{Error, Result};
 use crate::id::Uid;
-use crate::model::{StoredValue, Value};
+use crate::model::{StoredValue, Value, ValueKind};
 use crate::query::MatchMode;
-use crate::schema::{FieldProtection, TypeSchema};
+use crate::schema::{FieldDef, FieldIndex, FieldProtection, TypeSchema};
 use crate::storage::Table;
+use crate::tokens;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -47,6 +48,12 @@ pub struct RegistryRecord {
     pub recorded_at: u64,
     pub deleted: bool,
     pub fields: BTreeMap<String, StoredValue>,
+    /// Blind-index token digests per field ([`crate::schema::FieldIndex`]),
+    /// computed from the plaintext at write time. Persisting them here is
+    /// what keeps protected fields prefix/substring-searchable across
+    /// restarts — the plaintext is not on disk to re-derive them from.
+    #[serde(default)]
+    pub tokens: BTreeMap<String, Vec<String>>,
 }
 
 /// The in-memory, queryable side of one type's registry: version maps, search
@@ -64,6 +71,11 @@ pub(crate) struct RegistryIndex {
     /// *any* version. Keys are canonical bytes (plain fields) or the digest
     /// hex (hashed fields), so historical values stay searchable forever.
     index: HashMap<String, HashMap<Vec<u8>, HashSet<String>>>,
+    /// field -> token digest -> entity_ids that carried that token in *any*
+    /// version (the per-version token sets live on the records themselves).
+    /// Posting lists for [`FieldIndex`] searches, rebuilt from
+    /// [`RegistryRecord::tokens`] on open.
+    token_index: HashMap<String, HashMap<String, HashSet<String>>>,
     /// (version uid, field) -> plaintext canonical bytes, memory-only.
     /// Two sources: values *written by this process* for protected fields
     /// (held at upsert time, before protection is applied) and RSA values
@@ -86,6 +98,7 @@ impl RegistryIndex {
             versions: HashMap::new(),
             by_uid: HashMap::new(),
             index: HashMap::new(),
+            token_index: HashMap::new(),
             held: HashMap::new(),
             cache_plaintexts,
         }
@@ -102,6 +115,15 @@ impl RegistryIndex {
                     .entry(name.clone())
                     .or_default()
                     .entry(key)
+                    .or_default()
+                    .insert(rec.entity_id.clone());
+            }
+        }
+        for (field, digests) in &rec.tokens {
+            let posting = self.token_index.entry(field.clone()).or_default();
+            for d in digests {
+                posting
+                    .entry(d.clone())
                     .or_default()
                     .insert(rec.entity_id.clone());
             }
@@ -160,38 +182,174 @@ impl RegistryIndex {
                 out.sort();
                 Ok(out)
             }
+            MatchMode::ExactCi => {
+                let norm = tokens::normalize(&probe_text(probe));
+                if def.search == FieldIndex::Exact {
+                    let d = keys.index_token_digest(&def.name, def.protection, &norm)?;
+                    return Ok(self.token_candidates(&def.name, &[d], include_past));
+                }
+                self.scan_matching(field, &def, include_past, keys, None, |hay| {
+                    tokens::normalize(&String::from_utf8_lossy(hay)) == norm
+                })
+            }
+            MatchMode::Prefix => {
+                let norm = tokens::normalize(&probe_text(probe));
+                if let FieldIndex::Prefix(n) = def.search {
+                    let plen = norm.chars().count();
+                    if (1..=n).contains(&plen) {
+                        let d = keys.index_token_digest(&def.name, def.protection, &norm)?;
+                        return Ok(self.token_candidates(&def.name, &[d], include_past));
+                    }
+                    // probe longer than the declared prefix depth: fall back
+                    // to the plaintext scan below (plain fields always work;
+                    // protected fields need the plaintext cache)
+                }
+                self.scan_matching(field, &def, include_past, keys, None, |hay| {
+                    tokens::normalize(&String::from_utf8_lossy(hay)).starts_with(&norm)
+                })
+            }
             MatchMode::Contains => {
-                if def.protection != FieldProtection::None && !self.cache_plaintexts {
-                    return Err(Error::Schema(format!(
-                        "field '{field}' is protected and the plaintext cache is disabled — \
-                         enable StoreConfig::plaintext_cache to LIKE-search protected fields, \
-                         or use exact match"
-                    )));
+                if let FieldIndex::Ngram(n) = def.search {
+                    if let Some(toks) = tokens::ngram_probe_tokens(&probe_text(probe), n) {
+                        let digests: Vec<String> = toks
+                            .iter()
+                            .map(|t| keys.index_token_digest(&def.name, def.protection, t))
+                            .collect::<Result<_>>()?;
+                        let candidates = self.token_candidates(&def.name, &digests, include_past);
+                        let norm = tokens::normalize(&probe_text(probe));
+                        return match def.protection {
+                            // plaintext at hand: confirm the real substring
+                            // (case-insensitive — the index is normalized)
+                            FieldProtection::None => self.scan_matching(
+                                field,
+                                &def,
+                                include_past,
+                                keys,
+                                Some(&candidates),
+                                |hay| {
+                                    tokens::normalize(&String::from_utf8_lossy(hay)).contains(&norm)
+                                },
+                            ),
+                            // decryptable: only candidates are decrypted, so
+                            // the index turns the full decrypt-scan into a
+                            // candidate-scan (cache requirement unchanged —
+                            // scan_matching enforces it)
+                            FieldProtection::Rsa => self.scan_matching(
+                                field,
+                                &def,
+                                include_past,
+                                keys,
+                                Some(&candidates),
+                                |hay| {
+                                    tokens::normalize(&String::from_utf8_lossy(hay)).contains(&norm)
+                                },
+                            ),
+                            // one-way hashed: nothing to verify against — the
+                            // candidates are the result (may contain false
+                            // positives, see FieldIndex::Ngram)
+                            FieldProtection::Sha256 | FieldProtection::Hmac => Ok(candidates),
+                        };
+                    }
+                    // probe shorter than n: the index cannot help, fall back
                 }
                 // full scan over the in-memory registry (no index needed)
                 let pat = probe.canonical_bytes();
-                let uids: Vec<Uid> = if include_past {
-                    self.by_uid.keys().copied().collect()
-                } else {
-                    self.versions
-                        .values()
-                        .filter_map(|v| v.last().copied())
-                        .filter(|u| !self.by_uid[u].deleted)
-                        .collect()
-                };
-                let mut hits = HashSet::new();
-                for uid in uids {
-                    if let Some(hay) = self.plaintext_of(uid, field, keys)? {
-                        if contains(&hay, &pat) {
-                            hits.insert(self.by_uid[&uid].entity_id.clone());
-                        }
-                    }
-                }
-                let mut out: Vec<String> = hits.into_iter().collect();
-                out.sort();
-                Ok(out)
+                self.scan_matching(field, &def, include_past, keys, None, |hay| {
+                    contains(hay, &pat)
+                })
             }
         }
+    }
+
+    /// Entities with a version whose blind-index token set covers *all*
+    /// `digests` (the per-record check keeps tokens of different versions
+    /// from being combined into a phantom match). `include_past = false`
+    /// restricts to the latest, non-deleted version.
+    fn token_candidates(&self, field: &str, digests: &[String], include_past: bool) -> Vec<String> {
+        let Some(posting) = self.token_index.get(field) else {
+            return Vec::new();
+        };
+        let mut iter = digests.iter();
+        let Some(first) = iter.next() else {
+            return Vec::new();
+        };
+        let Some(mut ids) = posting.get(first).cloned() else {
+            return Vec::new();
+        };
+        for d in iter {
+            match posting.get(d) {
+                Some(s) => ids.retain(|id| s.contains(id)),
+                None => return Vec::new(),
+            }
+        }
+        let carries_all = |uid: &Uid| {
+            self.by_uid[uid]
+                .tokens
+                .get(field)
+                .is_some_and(|t| digests.iter().all(|d| t.contains(d)))
+        };
+        let mut out: Vec<String> = ids
+            .into_iter()
+            .filter(|id| {
+                let uids = self.versions.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                if include_past {
+                    uids.iter().any(carries_all)
+                } else {
+                    uids.last()
+                        .is_some_and(|u| !self.by_uid[u].deleted && carries_all(u))
+                }
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Scan plaintexts (all of them, or only the versions of `restrict`ed
+    /// entity_ids) and keep entities where `pred` accepts some version.
+    fn scan_matching(
+        &mut self,
+        field: &str,
+        def: &FieldDef,
+        include_past: bool,
+        keys: &KeyRing,
+        restrict: Option<&[String]>,
+        pred: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<String>> {
+        if def.protection != FieldProtection::None && !self.cache_plaintexts {
+            return Err(Error::Schema(format!(
+                "field '{field}' is protected and the plaintext cache is disabled — \
+                 enable StoreConfig::plaintext_cache, declare a FieldIndex on the \
+                 field, or use exact match"
+            )));
+        }
+        let latest_alive =
+            |versions: &Vec<Uid>| versions.last().copied().filter(|u| !self.by_uid[u].deleted);
+        let uids: Vec<Uid> = match restrict {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| self.versions.get(id))
+                .flat_map(|v| {
+                    if include_past {
+                        v.clone()
+                    } else {
+                        latest_alive(v).into_iter().collect()
+                    }
+                })
+                .collect(),
+            None if include_past => self.by_uid.keys().copied().collect(),
+            None => self.versions.values().filter_map(latest_alive).collect(),
+        };
+        let mut hits = HashSet::new();
+        for uid in uids {
+            if let Some(hay) = self.plaintext_of(uid, field, keys)? {
+                if pred(&hay) {
+                    hits.insert(self.by_uid[&uid].entity_id.clone());
+                }
+            }
+        }
+        let mut out: Vec<String> = hits.into_iter().collect();
+        out.sort();
+        Ok(out)
     }
 
     /// Plaintext canonical bytes of one version's field, if recoverable:
@@ -269,6 +427,22 @@ impl TypeRegistry {
                     f.name, schema.type_name
                 )));
             }
+            match f.search {
+                FieldIndex::None => {}
+                FieldIndex::Prefix(0) | FieldIndex::Ngram(0) => {
+                    return Err(Error::Schema(format!(
+                        "field '{}' of type '{}': FieldIndex size must be >= 1",
+                        f.name, schema.type_name
+                    )));
+                }
+                _ if f.kind != ValueKind::Text => {
+                    return Err(Error::Schema(format!(
+                        "field '{}' of type '{}': FieldIndex requires a Text field",
+                        f.name, schema.type_name
+                    )));
+                }
+                _ => {}
+            }
         }
         let mut table = Table::open(dir, max_segment_bytes)?;
         let mut idx = RegistryIndex::new(schema, cache_plaintexts);
@@ -305,9 +479,21 @@ impl TypeRegistry {
         }
         let uid = Uid::generate();
         let mut fields = BTreeMap::new();
+        let mut token_map = BTreeMap::new();
         for def in &self.idx.schema.fields {
             if let Some(v) = input.fields.get(&def.name) {
                 fields.insert(def.name.clone(), keys.protect(v, def.protection)?);
+                // blind-index tokens must be derived now, while the plaintext
+                // exists — for protected fields it is not on disk to re-derive
+                if def.search != FieldIndex::None {
+                    if let Value::Text(s) = v {
+                        let digests = tokens::value_tokens(s, def.search)
+                            .iter()
+                            .map(|t| keys.index_token_digest(&def.name, def.protection, t))
+                            .collect::<Result<Vec<_>>>()?;
+                        token_map.insert(def.name.clone(), digests);
+                    }
+                }
                 // hold the plaintext in memory so protected fields written by
                 // this process stay LIKE-searchable (never persisted; opt-in)
                 if self.idx.cache_plaintexts && def.protection != FieldProtection::None {
@@ -331,6 +517,7 @@ impl TypeRegistry {
             recorded_at: crate::time::now_micros(),
             deleted: false,
             fields,
+            tokens: token_map,
         };
         self.table.append(&rec, rec.recorded_at)?;
         self.table.flush()?;
@@ -355,6 +542,7 @@ impl TypeRegistry {
             recorded_at: crate::time::now_micros(),
             deleted: true,
             fields: latest.fields.clone(),
+            tokens: latest.tokens.clone(),
         };
         self.table.append(&rec, rec.recorded_at)?;
         self.table.flush()?;
@@ -441,6 +629,11 @@ fn index_key(stored: &StoredValue) -> Option<Vec<u8>> {
         StoredValue::Sha256(hex) | StoredValue::Hmac(hex) => Some(hex.as_bytes().to_vec()),
         StoredValue::Rsa { .. } => None,
     }
+}
+
+/// Probe value as text, for normalized-token searches.
+fn probe_text(v: &Value) -> String {
+    String::from_utf8_lossy(&v.canonical_bytes()).into_owned()
 }
 
 fn contains(hay: &[u8], pat: &[u8]) -> bool {

@@ -8,11 +8,22 @@ use std::collections::BTreeMap;
 pub enum MatchMode {
     #[default]
     Exact,
+    /// Case-insensitive exact match. Plain fields are scanned; protected
+    /// fields need [`crate::schema::FieldIndex::Exact`] declared (the
+    /// lowercased token digest is looked up — no false positives).
+    ExactCi,
+    /// Case-insensitive prefix match. Plain fields are scanned; protected
+    /// fields need [`crate::schema::FieldIndex::Prefix`] covering the probe
+    /// length (prefix tokens are exact — no false positives).
+    Prefix,
     /// LIKE-style substring match. Works on plain fields (in-memory scan) and
     /// on RSA fields (values are decrypted with the private key and cached
     /// per immutable version, so each value is decrypted at most once per
     /// process). One-way hashed fields (Sha256/Hmac) cannot be
-    /// substring-searched — the plaintext is never stored.
+    /// substring-scanned — the plaintext is never stored — unless they
+    /// declare [`crate::schema::FieldIndex::Ngram`], which matches candidate
+    /// digests instead (case-insensitive, may include false positives). An
+    /// Ngram index also narrows RSA fields to candidates before decryption.
     Contains,
 }
 
@@ -45,6 +56,18 @@ impl TargetFilter {
     /// Switch to substring (LIKE) matching — see [`MatchMode::Contains`].
     pub fn contains(mut self) -> Self {
         self.mode = MatchMode::Contains;
+        self
+    }
+
+    /// Switch to case-insensitive exact matching — see [`MatchMode::ExactCi`].
+    pub fn exact_ci(mut self) -> Self {
+        self.mode = MatchMode::ExactCi;
+        self
+    }
+
+    /// Switch to prefix matching — see [`MatchMode::Prefix`].
+    pub fn prefix(mut self) -> Self {
+        self.mode = MatchMode::Prefix;
         self
     }
 

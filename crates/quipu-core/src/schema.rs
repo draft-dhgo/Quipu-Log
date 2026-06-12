@@ -20,6 +20,37 @@ pub enum FieldProtection {
     Rsa,
 }
 
+/// Opt-in *blind index* over a text field: normalized (lowercased) tokens are
+/// derived from the plaintext at write time, digested (domain-separated from
+/// the field's own stored digest — see
+/// [`crate::KeyRing::index_token_digest`]) and persisted next to the record.
+/// This is what makes prefix/substring search possible on protected fields,
+/// where the plaintext is never on disk.
+///
+/// Declaring an index is declaring a leak: token digests reveal which stored
+/// values share prefixes/fragments to anyone holding the digest key. Keep it
+/// `None` unless the field genuinely needs the search shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FieldIndex {
+    #[default]
+    None,
+    /// One token: the whole lowercased value. Enables case-insensitive exact
+    /// search ([`crate::MatchMode::ExactCi`]) on protected fields.
+    Exact,
+    /// Lowercased prefixes of 1..=n chars. Enables prefix search
+    /// ([`crate::MatchMode::Prefix`]) for probes up to n chars, with no false
+    /// positives (each token *is* the exact prefix).
+    Prefix(usize),
+    /// Lowercased n-char windows (n = 3 is the usual trigram choice; values
+    /// shorter than n are indexed as one whole-value token). Lets
+    /// [`crate::MatchMode::Contains`] narrow to candidates instead of
+    /// scanning, for probes of at least n chars. On one-way hashed fields the
+    /// candidates cannot be verified against the plaintext, so matches may
+    /// include false positives (matching fragments that are not contiguous);
+    /// pair with [`FieldProtection::Rsa`] when hits must be exact.
+    Ngram(usize),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDef {
     pub name: String,
@@ -29,6 +60,9 @@ pub struct FieldDef {
     /// (current and historical values). RSA-protected fields cannot be indexed.
     pub indexed: bool,
     pub required: bool,
+    /// Blind token index for prefix/substring/case-insensitive search — see
+    /// [`FieldIndex`]. Text fields only.
+    pub search: FieldIndex,
 }
 
 impl FieldDef {
@@ -39,6 +73,7 @@ impl FieldDef {
             protection: FieldProtection::None,
             indexed: false,
             required: false,
+            search: FieldIndex::None,
         }
     }
 
@@ -59,6 +94,13 @@ impl FieldDef {
 
     pub fn protection(mut self, p: FieldProtection) -> Self {
         self.protection = p;
+        self
+    }
+
+    /// Attach a blind token index — see [`FieldIndex`] for the search shapes
+    /// and the leakage trade-off.
+    pub fn search(mut self, idx: FieldIndex) -> Self {
+        self.search = idx;
         self
     }
 }

@@ -189,6 +189,14 @@ impl AuditStore {
                             schema.type_name, old.name
                         )));
                     }
+                    Some(new) if new.search != old.search => {
+                        return Err(Error::Schema(format!(
+                            "type '{}': field '{}' cannot change its FieldIndex — records \
+                             written under the old index carry no tokens for the new one \
+                             and would silently stop matching",
+                            schema.type_name, old.name
+                        )));
+                    }
                     _ => {}
                 }
             }
