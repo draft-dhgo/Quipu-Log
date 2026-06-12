@@ -11,8 +11,7 @@ use std::time::Duration;
 
 /// Upper bounds (seconds) of the write-latency histogram buckets. A final
 /// implicit `+Inf` bucket catches everything slower.
-pub const LATENCY_BUCKETS_SECS: [f64; 9] =
-    [0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0];
+pub const LATENCY_BUCKETS_SECS: [f64; 9] = [0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0];
 
 /// Shared, lock-free pipeline counters. One instance lives behind an `Arc`
 /// in every [`crate::AuditHandle`] clone and in the writer thread.
@@ -85,7 +84,8 @@ impl PipelineMetrics {
     }
 
     pub(crate) fn rejected_queue_full(&self) {
-        self.emit_rejected_queue_full.fetch_add(1, Ordering::Relaxed);
+        self.emit_rejected_queue_full
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn rejected_disk_full(&self) {

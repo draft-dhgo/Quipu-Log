@@ -1,5 +1,5 @@
 use quipu_core::AuditStore;
-use quipu_middleware::{AuditPipeline, PermissionPolicy, PipelineConfig};
+use quipu_middleware::{AuditPipeline, PermissionPolicy};
 use quipu_server::{router, AppState, ServerConfig};
 
 fn usage() -> ! {
@@ -49,9 +49,9 @@ async fn main() {
     // or a SIGHUP grant change could never take effect
     let pipeline = match AuditPipeline::start(
         store,
-        store_root,
+        store_root.clone(),
         PermissionPolicy::allow_all(),
-        PipelineConfig::default(),
+        cfg.pipeline_config(),
         None,
     ) {
         Ok(p) => p,
@@ -68,7 +68,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let state = AppState::new(pipeline.handle(), auth_state);
+    let state = AppState::new(pipeline.handle(), auth_state, store_root);
 
     // SIGHUP = re-read the config file and swap the auth section (token
     // issue/revoke without dropping connections); reload failures keep the

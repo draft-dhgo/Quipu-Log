@@ -43,7 +43,9 @@ fn metrics_reflect_writes_after_emit_and_flush() {
     assert_eq!(before.writes_ok, 0);
 
     for i in 0..25 {
-        handle.emit_unchecked(event(&format!("/api/m/{i}"))).unwrap();
+        handle
+            .emit_unchecked(event(&format!("/api/m/{i}")))
+            .unwrap();
     }
     handle.flush().unwrap();
 

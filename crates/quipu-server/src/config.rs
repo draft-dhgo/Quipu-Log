@@ -20,6 +20,10 @@ pub struct ServerConfig {
     /// Periodic integrity verification. Omit to disable (the
     /// `POST /v1/admin/verify` endpoint works either way).
     pub verify: Option<VerifySection>,
+    /// Disk-space thresholds and disk-full behaviour. Omit for the defaults
+    /// (warn below 1 GiB or 10% free; keep accepting emits while full).
+    #[serde(default)]
+    pub health: HealthSection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +33,10 @@ pub struct StoreSection {
     pub max_segment_bytes: Option<u64>,
     pub sync_policy: Option<SyncPolicySpec>,
     pub retention_days: Option<u64>,
+    /// Byte budget for the logs + relations tables. Combines with
+    /// `retention_days` as OR: the oldest sealed segments are dropped as
+    /// soon as either limit is exceeded.
+    pub retention_max_bytes: Option<u64>,
     /// See [`StoreConfig::plaintext_cache`] — opt-in, keeps protected
     /// plaintexts in server memory to allow Contains search on them.
     #[serde(default)]
@@ -67,6 +75,25 @@ pub struct TlsSection {
     pub cert_pem_file: PathBuf,
     /// Private key for the certificate (PKCS#8/PKCS#1/SEC1 PEM).
     pub key_pem_file: PathBuf,
+}
+
+/// Disk-space thresholds (drive the `/v1/healthz` `degraded` state, the
+/// low-disk warning log and the fallback notification) and the disk-full
+/// emit behaviour.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthSection {
+    /// Warn when free space under the store root drops below this many
+    /// bytes (default 1 GiB).
+    pub min_free_bytes: Option<u64>,
+    /// Warn when free space drops below this fraction of the filesystem
+    /// (default 0.10). Either bound trips the warning.
+    pub min_free_ratio: Option<f64>,
+    /// When `true`, `POST /v1/logs` answers 507 immediately while the
+    /// disk-full latch is set, instead of queueing events that cannot be
+    /// persisted (default `false`).
+    #[serde(default)]
+    pub reject_emit_when_disk_full: bool,
 }
 
 /// Background tamper-evidence verification of the whole store.
@@ -230,10 +257,32 @@ impl ServerConfig {
                 SyncPolicySpec::OsManaged => SyncPolicy::OsManaged,
             });
         }
-        if let Some(days) = self.store.retention_days {
-            cfg = cfg.retention(RetentionPolicy::days(days));
+        let mut retention = match self.store.retention_days {
+            Some(days) => RetentionPolicy::days(days),
+            None => RetentionPolicy::keep_forever(),
+        };
+        if let Some(bytes) = self.store.retention_max_bytes {
+            retention = retention.with_max_bytes(bytes);
         }
+        cfg = cfg.retention(retention);
         Ok(cfg)
+    }
+
+    /// Pipeline configuration derived from the `health` section (defaults
+    /// elsewhere are [`PipelineConfig::default`]'s).
+    pub fn pipeline_config(&self) -> quipu_middleware::PipelineConfig {
+        let mut thresholds = quipu_middleware::DiskThresholds::default();
+        if let Some(n) = self.health.min_free_bytes {
+            thresholds.min_free_bytes = n;
+        }
+        if let Some(r) = self.health.min_free_ratio {
+            thresholds.min_free_ratio = r;
+        }
+        quipu_middleware::PipelineConfig {
+            disk_thresholds: thresholds,
+            reject_emit_when_disk_full: self.health.reject_emit_when_disk_full,
+            ..Default::default()
+        }
     }
 
     /// The complete hot-reloadable auth view (tokens + grants + query cap).

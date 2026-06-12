@@ -36,8 +36,10 @@ fn append_n(store: &mut AuditStore, n: usize) {
 fn max_bytes_drops_oldest_segments_and_keeps_integrity() {
     let dir = tempfile::tempdir().unwrap();
     let budget = 16 * 1024;
-    let mut store =
-        open_store_with(dir.path(), RetentionPolicy::keep_forever().with_max_bytes(budget));
+    let mut store = open_store_with(
+        dir.path(),
+        RetentionPolicy::keep_forever().with_max_bytes(budget),
+    );
     append_n(&mut store, 200);
 
     let before = store.retained_bytes().unwrap();
@@ -58,8 +60,14 @@ fn max_bytes_drops_oldest_segments_and_keeps_integrity() {
     // oldest data is gone, newest survives (active segment is never dropped)
     let hits = store.query(&LogQuery::default()).unwrap();
     assert!(!hits.is_empty());
-    assert!(hits.iter().all(|h| h.url != "/api/items/0"), "oldest purged");
-    assert!(hits.iter().any(|h| h.url == "/api/items/199"), "newest kept");
+    assert!(
+        hits.iter().all(|h| h.url != "/api/items/0"),
+        "oldest purged"
+    );
+    assert!(
+        hits.iter().any(|h| h.url == "/api/items/199"),
+        "newest kept"
+    );
 
     // whole-segment drops must not break the tamper-evidence chain
     store.verify_integrity().unwrap();

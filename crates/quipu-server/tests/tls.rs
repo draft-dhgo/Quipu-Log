@@ -31,6 +31,7 @@ fn test_state(root: &std::path::Path) -> (AppState, AuditPipeline) {
             policy: PermissionPolicy::deny_by_default(),
             max_concurrent_queries: None,
         },
+        root.to_path_buf(),
     );
     (state, pipeline)
 }
@@ -81,7 +82,7 @@ async fn healthz_over_tls() {
     stream.read_to_end(&mut response).await.unwrap();
     let response = String::from_utf8_lossy(&response);
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert!(response.ends_with("ok"), "{response}");
+    assert!(response.contains("\"status\":\"ok\""), "{response}");
 
     // graceful shutdown must hand control back so main can run
     // pipeline.shutdown() (the final fsync) on the TLS path too

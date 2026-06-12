@@ -63,6 +63,7 @@ fn test_state(
             policy,
             max_concurrent_queries,
         },
+        root.to_path_buf(),
     );
     (state, pipeline)
 }

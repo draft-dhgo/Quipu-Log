@@ -16,7 +16,10 @@ pub mod auth;
 pub mod config;
 pub mod serve;
 
-pub use api::{router, spawn_periodic_verify, AppState, QuerySlot, VerifyGuard};
+pub use api::{
+    evaluate_health, render_prometheus, router, spawn_periodic_verify, AppState, HealthReport,
+    QuerySlot, VerifyGuard,
+};
 pub use auth::{sha256_hex, AuthState, TokenMap};
 pub use config::ServerConfig;
 pub use serve::{bind, serve};
