@@ -1,5 +1,7 @@
 # quipu-server
 
+English | [한국어](README.ko.md)
+
 Standalone audit-log daemon. It wraps the embedded `quipu-core` store in
 `quipu-middleware`'s async pipeline and exposes it over an HTTP/JSON API, so
 multiple services — in any language — can record and search audit logs
