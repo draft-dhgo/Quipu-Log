@@ -136,7 +136,9 @@ pub struct LogQuery {
 pub struct QueryPage {
     pub logs: Vec<LogView>,
     /// Present when more matches remain past this page; feed it back via
-    /// [`LogQuery::cursor`] to continue. `None` on the final page.
+    /// [`LogQuery::cursor`] to continue. `None` (absent on the wire) on the
+    /// final page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// Log segment files this query actually opened — observability for
     /// time-range pruning (a narrow window over a long history should open

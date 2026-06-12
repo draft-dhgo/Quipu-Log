@@ -170,7 +170,8 @@ Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
 | `GET /v1/types` | query | `[TypeSchema]` |
 | `POST /v1/columns` | administer | `CustomColumnDef` JSON → 204 |
 | `POST /v1/logs` | emit | append request → **202** `{"status":"queued"}` |
-| `POST /v1/logs/query` | query | `LogQuery` JSON → `[LogView]` |
+| `POST /v1/logs/query` | query | `LogQuery` JSON → `{"logs": [LogView], "next_cursor"?, "segments_scanned"}` |
+| `POST /v1/logs/count` | query | `LogQuery` JSON → `{"count": n}` (no rendering/decryption) |
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (latest versions) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (oldest first) |
 | `POST /v1/admin/flush` | administer | fsync everything queued → 204 |
@@ -228,6 +229,39 @@ All set conditions are AND-ed; everything is optional (`{}` returns everything u
 `mode` is `"exact"` (default), `"exact_ci"`, `"prefix"`, or `"contains"`;
 `include_past` defaults to `true` (a renamed entity is still found by its old name).
 Hits are `LogView` rows: the log plus actor/target snapshots exactly as recorded.
+
+The response is one **page**:
+
+```json
+{
+  "logs": [ ... ],
+  "next_cursor": "AQEDAAAAAAAAACkAAAAAAAAA",
+  "segments_scanned": 2
+}
+```
+
+- `order` is `"desc"` (default — newest first, so `limit` means "the latest N")
+  or `"asc"`. With a time range (`from_micros`/`to_micros`), segment files
+  entirely outside the window are never even opened.
+- `next_cursor` is present when more matches remain. Send it back verbatim as
+  `"cursor"` with an otherwise **identical** query to get the next page; it is
+  an opaque token, not something to parse. The last page has no `next_cursor`.
+- A cursor stays valid while you paginate: records appended after a
+  newest-first listing started do not shift, duplicate, or punch holes in the
+  remaining pages (they appear in the *next* fresh query).
+- A cursor that does not decode, or was issued under the opposite `order`,
+  gets a 400.
+
+To size a result set without paying for rendering or decryption, use
+`POST /v1/logs/count` with the same `LogQuery` body (`limit`, `cursor` and
+`order` are ignored):
+
+```sh
+curl -s -X POST localhost:7700/v1/logs/count \
+  -H 'Authorization: Bearer aud1tor-t0ken' -H 'Content-Type: application/json' \
+  -d '{ "method": "DELETE", "from_micros": 1780000000000000 }'
+# {"count": 1843}
+```
 
 ### Defining a type
 

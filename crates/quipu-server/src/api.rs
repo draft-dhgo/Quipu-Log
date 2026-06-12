@@ -144,6 +144,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/columns", post(define_column))
         .route("/v1/logs", post(append_log))
         .route("/v1/logs/query", post(query_logs))
+        .route("/v1/logs/count", post(count_logs))
         .route("/v1/entities/{type_name}", get(list_entities))
         .route(
             "/v1/entities/{type_name}/{entity_id}/history",
@@ -181,9 +182,9 @@ impl From<MiddlewareError> for ApiError {
             MiddlewareError::QueueFull(_) => StatusCode::SERVICE_UNAVAILABLE,
             MiddlewareError::WorkerGone => StatusCode::INTERNAL_SERVER_ERROR,
             MiddlewareError::Core(core) => match core {
-                quipu_core::Error::Schema(_) | quipu_core::Error::Crypto(_) => {
-                    StatusCode::BAD_REQUEST
-                }
+                quipu_core::Error::Schema(_)
+                | quipu_core::Error::Crypto(_)
+                | quipu_core::Error::InvalidCursor(_) => StatusCode::BAD_REQUEST,
                 quipu_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
@@ -320,14 +321,20 @@ async fn append_log(
     ))
 }
 
+/// One page of matches, newest-first by default. The request body is a
+/// `LogQuery`: `limit` is the page size, `order` is `"desc"`/`"asc"`, and
+/// `cursor` continues from a previous response's `next_cursor` (opaque —
+/// send it back verbatim with an otherwise identical query). The response is
+/// `{ "logs": [...], "next_cursor": "...", "segments_scanned": n }`;
+/// `next_cursor` is absent on the final page.
 async fn query_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(q): Json<LogQuery>,
-) -> Result<Json<Vec<quipu_core::LogView>>, ApiError> {
+) -> Result<Json<quipu_core::QueryPage>, ApiError> {
     let caller = state.authorize(&headers, Action::Query)?;
-    // queries are full scans — hold one of the token's slots for the whole
-    // scan so a single token cannot monopolise the blocking pool
+    // a query may still scan many segments — hold one of the token's slots
+    // for the whole scan so a single token cannot monopolise the blocking pool
     let _slot = match state.query_slot(&caller.token_hash) {
         QuerySlot::Busy => {
             return Err(ApiError {
@@ -340,7 +347,31 @@ async fn query_logs(
     let role = caller.role;
     let handle = state.handle.clone();
     // the scan runs on the snapshot in the blocking pool; appends keep flowing
-    Ok(Json(blocking(move || handle.query(&role, q)).await?))
+    Ok(Json(blocking(move || handle.query_page(&role, q)).await?))
+}
+
+/// Total number of matches for a `LogQuery`, without rendering (no registry
+/// resolution, no decryption). `limit`/`cursor`/`order` in the body are
+/// ignored. Response: `{ "count": n }`.
+async fn count_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(q): Json<LogQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let caller = state.authorize(&headers, Action::Query)?;
+    let _slot = match state.query_slot(&caller.token_hash) {
+        QuerySlot::Busy => {
+            return Err(ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "too many concurrent queries for this token".into(),
+            })
+        }
+        slot => slot,
+    };
+    let role = caller.role;
+    let handle = state.handle.clone();
+    let n = blocking(move || handle.count(&role, q)).await?;
+    Ok(Json(serde_json::json!({ "count": n })))
 }
 
 // ---- registry browsing -------------------------------------------------------
