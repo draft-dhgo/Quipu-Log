@@ -57,7 +57,7 @@ impl StoreConfig {
             root: root.into(),
             max_segment_bytes: 64 * 1024 * 1024,
             sync_policy: SyncPolicy::EveryN(64),
-            retention: RetentionPolicy::KeepForever,
+            retention: RetentionPolicy::keep_forever(),
             keys: KeyRing::new(),
             plaintext_cache: false,
             anchor: None,
@@ -581,13 +581,18 @@ impl AuditStore {
 
     // ---- retention -----------------------------------------------------------
 
-    /// Enforce the configured retention window now. Returns segments dropped.
+    /// Enforce the configured retention limits now (age window, byte budget,
+    /// or both — they combine as OR; see [`RetentionPolicy`]). Returns
+    /// segments dropped.
     pub fn apply_retention(&mut self) -> Result<usize> {
-        let Some(cutoff) = self.cfg.retention.cutoff_micros(crate::time::now_micros()) else {
-            return Ok(0);
-        };
-        let mut dropped = self.logs.purge_older_than(cutoff)?;
-        dropped += self.relations.purge_older_than(cutoff)?;
+        let mut dropped = 0usize;
+        if let Some(cutoff) = self.cfg.retention.cutoff_micros(crate::time::now_micros()) {
+            dropped += self.logs.purge_older_than(cutoff)?;
+            dropped += self.relations.purge_older_than(cutoff)?;
+        }
+        if let Some(budget) = self.cfg.retention.max_bytes {
+            dropped += self.purge_to_byte_budget(budget)?;
+        }
         if dropped > 0 {
             // re-anchor after the unlink: the previous latest checkpoint may
             // point into a purged segment, and verification must not depend
@@ -595,6 +600,47 @@ impl AuditStore {
             self.write_checkpoint()?;
         }
         Ok(dropped)
+    }
+
+    /// While logs + relations exceed `budget` bytes, drop the globally oldest
+    /// sealed segment (by its max record timestamp, across both tables) —
+    /// the same "whole old segments first" shape as the age window, so the
+    /// hash chain and checkpoint verification stay intact. Stops when only
+    /// active segments remain: the budget is a target, not a hard ceiling.
+    fn purge_to_byte_budget(&mut self, budget: u64) -> Result<usize> {
+        let mut total = self.logs.total_bytes()? + self.relations.total_bytes()?;
+        let mut dropped = 0usize;
+        while total > budget {
+            let from_logs = match (
+                self.logs.oldest_sealed_max_ts(),
+                self.relations.oldest_sealed_max_ts(),
+            ) {
+                (Some(l), Some(r)) => l <= r,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break, // only active segments left
+            };
+            let freed = if from_logs {
+                self.logs.purge_oldest_sealed()?
+            } else {
+                self.relations.purge_oldest_sealed()?
+            };
+            match freed {
+                Some(bytes) => {
+                    total = total.saturating_sub(bytes);
+                    dropped += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// Bytes currently on disk in the retention-governed tables
+    /// (logs + relations) — the number [`RetentionPolicy::max_bytes`] is
+    /// compared against. Registries and meta are not included.
+    pub fn retained_bytes(&mut self) -> Result<u64> {
+        Ok(self.logs.total_bytes()? + self.relations.total_bytes()?)
     }
 
     // ---- registry browsing -----------------------------------------------------

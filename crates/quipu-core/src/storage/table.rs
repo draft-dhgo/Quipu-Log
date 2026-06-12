@@ -173,6 +173,38 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         Ok(doomed.len())
     }
 
+    /// Bytes on disk across all segments: sealed file sizes plus the active
+    /// segment's current length (flushed first so the number is accurate).
+    pub fn total_bytes(&mut self) -> Result<u64> {
+        self.active.flush()?;
+        let mut total = self.active.len();
+        for (path, _, _) in self.sealed.values() {
+            total += std::fs::metadata(path)?.len();
+        }
+        Ok(total)
+    }
+
+    /// Max record timestamp of the oldest sealed segment (`None` when only
+    /// the active segment exists). Drives the cross-table "drop the globally
+    /// oldest first" order of capacity-based retention.
+    pub fn oldest_sealed_max_ts(&self) -> Option<u64> {
+        self.sealed.values().next().map(|(_, max_ts, _)| *max_ts)
+    }
+
+    /// Unlink the oldest sealed segment and return the bytes freed (`None`
+    /// when there is no sealed segment — the active one is never dropped).
+    /// Like [`purge_older_than`](Self::purge_older_than) this removes a whole
+    /// chain prefix, so it cannot break hash-chain verification.
+    pub fn purge_oldest_sealed(&mut self) -> Result<Option<u64>> {
+        let Some(&seq) = self.sealed.keys().next() else {
+            return Ok(None);
+        };
+        let (path, _, _) = self.sealed.remove(&seq).expect("key just observed");
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        std::fs::remove_file(path)?;
+        Ok(Some(bytes))
+    }
+
     /// Sequence number of the segment currently being written.
     pub fn active_seq(&self) -> u64 {
         self.active_seq
