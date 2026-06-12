@@ -1,0 +1,14 @@
+[package]
+name = "axum-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+audit-core = { path = "../../crates/audit-core" }
+audit-middleware = { path = "../../crates/audit-middleware" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }
