@@ -12,7 +12,7 @@ use quipu_core::*;
 use quipu_middleware::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn env_secs(name: &str, default: u64) -> Duration {
     Duration::from_secs(
@@ -166,9 +166,9 @@ fn emit_flush_retention_query_run_concurrently() {
     pipeline.shutdown();
 
     // reopen after shutdown: recovery + chain verification must still hold
-    let mut store = AuditStore::open(
-        StoreConfig::new(dir.path()).sync_policy(SyncPolicy::OsManaged),
-    )
-    .unwrap();
-    store.verify_integrity().expect("reopened store fails verification");
+    let mut store =
+        AuditStore::open(StoreConfig::new(dir.path()).sync_policy(SyncPolicy::OsManaged)).unwrap();
+    store
+        .verify_integrity()
+        .expect("reopened store fails verification");
 }

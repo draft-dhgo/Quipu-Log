@@ -266,9 +266,7 @@ impl<T: DeserializeOwned> TableScan<T> {
                 // error (concurrent retention + query must not fail reads)
                 self.current = match SegmentReader::open_bounded(&s.path, s.bound) {
                     Ok(r) => Some(r),
-                    Err(crate::error::Error::Io(e))
-                        if e.kind() == std::io::ErrorKind::NotFound =>
-                    {
+                    Err(crate::error::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                         continue;
                     }
                     Err(e) => return Err(e),

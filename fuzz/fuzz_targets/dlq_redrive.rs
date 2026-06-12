@@ -6,9 +6,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use quipu_core::{
-    default_actor_type, default_target_type, AuditStore, StoreConfig, SyncPolicy,
-};
+use quipu_core::{default_actor_type, default_target_type, AuditStore, StoreConfig, SyncPolicy};
 use quipu_middleware::{AuditPipeline, PermissionPolicy, PipelineConfig, Role};
 
 fuzz_target!(|data: &[u8]| {
