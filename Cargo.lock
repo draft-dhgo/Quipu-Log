@@ -945,6 +945,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "libc",
  "quipu-core",
  "serde",
  "serde_json",

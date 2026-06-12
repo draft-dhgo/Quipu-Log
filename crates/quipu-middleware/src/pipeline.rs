@@ -1,4 +1,6 @@
 use crate::event::AuditEvent;
+use crate::health::{disk_usage, DiskThresholds, HealthSnapshot, HealthState};
+use crate::metrics::{MetricsSnapshot, PipelineMetrics};
 use crate::permissions::{Action, PermissionPolicy, Role};
 use quipu_core::storage::{SegmentSlice, Table, TableScan};
 use quipu_core::{
@@ -23,6 +25,11 @@ pub enum MiddlewareError {
     },
     /// The worker thread has stopped.
     WorkerGone,
+    /// The disk-full latch is set and the pipeline is configured to reject
+    /// emits fast instead of queueing events that cannot be persisted (see
+    /// [`PipelineConfig::reject_emit_when_disk_full`]). The event is handed
+    /// back so the caller can route it to its own fallback.
+    DiskFull(Box<AuditEvent>),
     Core(quipu_core::Error),
 }
 
@@ -34,6 +41,9 @@ impl std::fmt::Display for MiddlewareError {
                 write!(f, "role '{}' is not allowed to {:?}", role.0, action)
             }
             MiddlewareError::WorkerGone => write!(f, "audit worker thread has stopped"),
+            MiddlewareError::DiskFull(_) => {
+                write!(f, "audit store disk is full; event rejected")
+            }
             MiddlewareError::Core(e) => write!(f, "audit store error: {e}"),
         }
     }
@@ -79,6 +89,16 @@ pub struct PipelineConfig {
     pub housekeeping_interval: Duration,
     /// Where DLQ segments live (defaults to `<store root>/dlq`).
     pub dlq_dir: Option<PathBuf>,
+    /// When free space under the store root drops below either bound, the
+    /// pipeline logs a warning, notifies the fallback hook once (on the
+    /// transition) and reports `low_disk` through [`AuditHandle::health`].
+    pub disk_thresholds: DiskThresholds,
+    /// When `true`, `emit` fails fast with [`MiddlewareError::DiskFull`]
+    /// (handing the event back) while the disk-full latch is set, instead of
+    /// queueing events that are bound for the fallback hook anyway. Off by
+    /// default: queued events would still be persisted if space frees up
+    /// before they reach the writer.
+    pub reject_emit_when_disk_full: bool,
 }
 
 impl Default for PipelineConfig {
@@ -89,6 +109,8 @@ impl Default for PipelineConfig {
             retry_backoff: Duration::from_millis(20),
             housekeeping_interval: Duration::from_secs(30),
             dlq_dir: None,
+            disk_thresholds: DiskThresholds::default(),
+            reject_emit_when_disk_full: false,
         }
     }
 }
@@ -131,6 +153,9 @@ enum Command {
 pub struct AuditHandle {
     tx: SyncSender<Command>,
     permissions: Arc<PermissionPolicy>,
+    metrics: Arc<PipelineMetrics>,
+    health: Arc<HealthState>,
+    reject_emit_when_disk_full: bool,
 }
 
 impl AuditHandle {
@@ -154,11 +179,46 @@ impl AuditHandle {
     /// Enqueue without a permission check (used by the HTTP layer, which has
     /// its own configured emitting identity).
     pub fn emit_unchecked(&self, event: AuditEvent) -> Result<(), MiddlewareError> {
+        if self.reject_emit_when_disk_full && self.health.disk_full() {
+            self.metrics.rejected_disk_full();
+            return Err(MiddlewareError::DiskFull(Box::new(event)));
+        }
+        // inc before send so the worker's dec (after recv) can never observe
+        // the gauge before the inc happened
+        self.metrics.queue_inc();
         match self.tx.try_send(Command::Emit(Box::new(event))) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(Command::Emit(ev))) => Err(MiddlewareError::QueueFull(ev)),
-            Err(_) => Err(MiddlewareError::WorkerGone),
+            Err(TrySendError::Full(Command::Emit(ev))) => {
+                self.metrics.queue_dec();
+                self.metrics.rejected_queue_full();
+                Err(MiddlewareError::QueueFull(ev))
+            }
+            Err(_) => {
+                self.metrics.queue_dec();
+                Err(MiddlewareError::WorkerGone)
+            }
         }
+    }
+
+    /// A point-in-time copy of the pipeline counters (queue depth, DLQ size,
+    /// write/retry/park/loss counts, write-latency histogram). Reads shared
+    /// atomics only — never round-trips the writer thread, so it works even
+    /// when the writer is wedged or dead.
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// A point-in-time copy of the pipeline health flags (writer liveness,
+    /// disk-full latch, low-disk warning). Same liveness guarantee as
+    /// [`metrics`](Self::metrics).
+    pub fn health(&self) -> HealthSnapshot {
+        self.health.snapshot()
+    }
+
+    /// The shared health flags themselves — for hosts/tests that need to
+    /// drive the state (e.g. simulating a full disk).
+    pub fn health_state(&self) -> Arc<HealthState> {
+        self.health.clone()
     }
 
     fn round_trip<T>(
@@ -318,8 +378,17 @@ impl AuditPipeline {
                 std::fs::rename(&staging, &dlq_dir).map_err(|e| MiddlewareError::Core(e.into()))?;
             }
         }
-        let dlq: Table<DlqEntry> =
+        let mut dlq: Table<DlqEntry> =
             Table::open(&dlq_dir, DLQ_SEGMENT_BYTES).map_err(MiddlewareError::Core)?;
+        let metrics = Arc::new(PipelineMetrics::default());
+        let health = Arc::new(HealthState::new(cfg.disk_thresholds));
+        // seed the DLQ gauge with what survived the restart
+        let parked = dlq
+            .scan()
+            .map_err(MiddlewareError::Core)?
+            .filter(|r| r.is_ok())
+            .count();
+        metrics.set_dlq_entries(parked as u64);
         let (tx, rx) = sync_channel(cfg.queue_capacity);
         let worker = Worker {
             store,
@@ -328,6 +397,8 @@ impl AuditPipeline {
             dlq_dir,
             cfg: cfg.clone(),
             fallback,
+            metrics: metrics.clone(),
+            health: health.clone(),
         };
         let join = std::thread::Builder::new()
             .name("audit-writer".into())
@@ -337,6 +408,9 @@ impl AuditPipeline {
             handle: AuditHandle {
                 tx,
                 permissions: Arc::new(permissions),
+                metrics,
+                health,
+                reject_emit_when_disk_full: cfg.reject_emit_when_disk_full,
             },
             join: Some(join),
         })
@@ -440,10 +514,23 @@ struct Worker {
     dlq_dir: PathBuf,
     cfg: PipelineConfig,
     fallback: Option<FallbackFn>,
+    metrics: Arc<PipelineMetrics>,
+    health: Arc<HealthState>,
+}
+
+/// Flips `writer_alive` to false when the worker leaves `run()` — including
+/// by panic, which is exactly the death health checks must be able to see.
+struct AliveGuard(Arc<HealthState>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.set_writer_alive(false);
+    }
 }
 
 impl Worker {
     fn run(mut self, rx: Receiver<Command>) {
+        let _alive = AliveGuard(self.health.clone());
         let mut shutdown_ack = None;
         loop {
             match rx.recv_timeout(self.cfg.housekeeping_interval) {
@@ -474,7 +561,10 @@ impl Worker {
 
     fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Emit(event) => self.write_event(*event),
+            Command::Emit(event) => {
+                self.metrics.queue_dec();
+                self.write_event(*event);
+            }
             Command::Shutdown(_) => unreachable!("handled in run()"),
             Command::Snapshot(reply) => {
                 let res = self
@@ -541,6 +631,10 @@ impl Worker {
                         .map_err(MiddlewareError::Core)?;
                     Ok(entries.filter(|r| r.is_ok()).count())
                 })();
+                if let Ok(n) = &res {
+                    // an exact count just happened; sync the gauge to it
+                    self.metrics.set_dlq_entries(*n as u64);
+                }
                 let _ = reply.send(res);
             }
             Command::VerifyIntegrity(reply) => {
@@ -598,19 +692,39 @@ impl Worker {
     }
 
     /// Persist one event with retries; park it in the DLQ on final failure.
-    /// Every outcome is logged (the "result logging" surface).
+    /// Every outcome is logged (the "result logging" surface) and counted
+    /// (the metrics surface).
+    ///
+    /// ENOSPC short-circuits the retry loop: disk-full is a persistent
+    /// condition, so backing off and rewriting the same bytes can only fail
+    /// again — the event goes straight to [`park`](Self::park) (whose DLQ
+    /// write usually also fails on the same disk, which is what the fallback
+    /// hook is for) and the disk-full latch is set for health/fast-reject.
     fn write_event(&mut self, event: AuditEvent) {
+        let started = std::time::Instant::now();
         let mut last_err = String::new();
         for attempt in 0..=self.cfg.max_retries {
             match self.try_write(&event) {
                 Ok(log_id) => {
+                    self.metrics.write_ok(started.elapsed());
+                    if self.health.set_disk_full(false) {
+                        tracing::info!("audit store writable again; disk-full latch cleared");
+                    }
                     tracing::debug!(%log_id, method = %event.method, url = %event.url, "audit log written");
                     return;
+                }
+                Err(e) if e.is_storage_full() => {
+                    last_err = e.to_string();
+                    if !self.health.set_disk_full(true) {
+                        tracing::error!(error = %last_err, "audit store disk is FULL; suspending retries");
+                    }
+                    break;
                 }
                 Err(e) => {
                     last_err = e.to_string();
                     tracing::warn!(attempt, error = %last_err, "audit write failed");
                     if attempt < self.cfg.max_retries {
+                        self.metrics.retry();
                         std::thread::sleep(self.cfg.retry_backoff);
                     }
                 }
@@ -620,6 +734,7 @@ impl Worker {
     }
 
     fn park(&mut self, event: AuditEvent, error: String) {
+        self.metrics.parked();
         let entry = DlqEntry {
             event,
             error: error.clone(),
@@ -631,12 +746,17 @@ impl Worker {
         });
         match dlq_result {
             Ok(()) => {
+                self.metrics.dlq_inc();
                 tracing::error!(error = %error, "audit event parked in dead-letter queue");
                 if let Some(fb) = &self.fallback {
                     fb(&entry.event, &error);
                 }
             }
             Err(dlq_err) => {
+                self.metrics.lost();
+                if dlq_err.is_storage_full() && !self.health.set_disk_full(true) {
+                    tracing::error!("DLQ disk is FULL; disk-full latch set");
+                }
                 // last line of defense: the fallback hook and the error log
                 tracing::error!(error = %error, dlq_error = %dlq_err, "audit event LOST (store and DLQ both failed)");
                 if let Some(fb) = &self.fallback {
@@ -674,6 +794,7 @@ impl Worker {
         }
         let mut staging: Table<DlqEntry> =
             Table::open(&staging_dir, DLQ_SEGMENT_BYTES).map_err(MiddlewareError::Core)?;
+        let total = entries.len();
         let mut ok = 0;
         for entry in entries {
             match self.try_write(&entry.event) {
@@ -705,6 +826,7 @@ impl Worker {
         std::fs::rename(&staging_dir, &self.dlq_dir)
             .map_err(|e| MiddlewareError::Core(e.into()))?;
         self.dlq().map_err(MiddlewareError::Core)?;
+        self.metrics.set_dlq_entries((total - ok) as u64);
         Ok(ok)
     }
 
@@ -716,6 +838,57 @@ impl Worker {
             Ok(0) => {}
             Ok(n) => tracing::info!(segments = n, "retention dropped old segments"),
             Err(e) => tracing::error!(error = %e, "retention failed"),
+        }
+        self.check_disk();
+    }
+
+    /// Measure free space under the store root, maintain the `low_disk`
+    /// early warning and release the disk-full latch once space is back
+    /// above the warning thresholds (the other release path is a write
+    /// simply succeeding again).
+    ///
+    /// The warning fires once per transition into low-disk — as a `warn` log
+    /// line *and* through the fallback hook (with a synthetic `system` event,
+    /// `url = "quipu://disk-space-low"`), so the same channel that hears
+    /// about lost events hears the early warning too.
+    fn check_disk(&mut self) {
+        let usage = match disk_usage(&self.store_root) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::debug!(error = %e, "disk usage measurement failed");
+                return;
+            }
+        };
+        let low = self.health.thresholds().is_low(&usage);
+        let was_low = self.health.set_low_disk(low);
+        if low && !was_low {
+            let msg = format!(
+                "disk space low under audit store root: {} free of {} bytes",
+                usage.free_bytes, usage.total_bytes
+            );
+            tracing::warn!(
+                free_bytes = usage.free_bytes,
+                total_bytes = usage.total_bytes,
+                "{msg}"
+            );
+            if let Some(fb) = &self.fallback {
+                let alert = AuditEvent::new(
+                    "system",
+                    quipu_core::EntityInput::new("quipu-pipeline"),
+                    "ALERT",
+                    "quipu://disk-space-low",
+                    quipu_core::Content::Text(msg.clone()),
+                );
+                fb(&alert, &msg);
+            }
+        } else if !low && was_low {
+            tracing::info!(
+                free_bytes = usage.free_bytes,
+                "disk space back above thresholds"
+            );
+        }
+        if !low && self.health.disk_full() && self.health.set_disk_full(false) {
+            tracing::info!("free space recovered; disk-full latch cleared");
         }
     }
 }
