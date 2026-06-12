@@ -420,9 +420,15 @@ fn count_log_records(root: &Path) -> usize {
     segments.sort();
     let slices = segments
         .into_iter()
-        .map(|path| SegmentSlice {
+        .enumerate()
+        .map(|(i, path)| SegmentSlice {
             path,
             bound: u64::MAX,
+            seq: i as u64,
+            // unknown bounds: a full-width range disables time pruning, which
+            // is exactly right for a "count everything readable" pass
+            min_ts: 0,
+            max_ts: u64::MAX,
         })
         .collect();
     TableScan::<AuditLog>::over(slices)
