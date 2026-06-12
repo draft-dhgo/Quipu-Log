@@ -1,3 +1,4 @@
+use crate::auth::{sha256_hex, AuthState, TokenEntry, TokenMap, HASH_PREFIX};
 use quipu_core::{KeyRing, RetentionPolicy, StoreConfig, SyncPolicy};
 use quipu_middleware::{Action, PermissionPolicy, Role};
 use serde::Deserialize;
@@ -54,10 +55,50 @@ pub struct KeysSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthSection {
-    /// Bearer token -> role name. One token per calling service.
-    pub tokens: HashMap<String, String>,
+    /// Bearer token -> role. One token per calling service. Keys are either
+    /// `sha256:<hex>` (recommended — the config file is then not a
+    /// credential) or the plaintext token; values are either a bare role
+    /// name or `{"role": ..., "expires": <unix epoch seconds>}`.
+    pub tokens: HashMap<String, TokenSpec>,
     /// Role name -> granted actions. Unknown roles are denied everything.
     pub grants: HashMap<String, Vec<ActionSpec>>,
+    /// Per-token cap on queries running at once (queries are full scans, so
+    /// one token must not be able to monopolise the CPU). `None` = unlimited.
+    #[serde(default)]
+    pub max_concurrent_queries: Option<u32>,
+}
+
+/// Both historical (`"token": "role"`) and extended
+/// (`"token": {"role": ..., "expires": ...}`) value shapes.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TokenSpec {
+    Role(String),
+    Detailed(TokenDetail),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenDetail {
+    pub role: String,
+    /// Unix epoch seconds; omit for a non-expiring token.
+    pub expires: Option<u64>,
+}
+
+impl TokenSpec {
+    fn role(&self) -> &str {
+        match self {
+            TokenSpec::Role(r) => r,
+            TokenSpec::Detailed(d) => &d.role,
+        }
+    }
+
+    fn expires(&self) -> Option<u64> {
+        match self {
+            TokenSpec::Role(_) => None,
+            TokenSpec::Detailed(d) => d.expires,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -66,6 +107,56 @@ pub enum ActionSpec {
     Emit,
     Query,
     Administer,
+}
+
+impl AuthSection {
+    /// Normalise every token key to its SHA-256: `sha256:` keys are validated
+    /// hex, plaintext keys are hashed here (with a warning — the config file
+    /// should not double as a credential store).
+    pub fn token_map(&self) -> std::io::Result<TokenMap> {
+        fn invalid(msg: String) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+        }
+        let mut map = TokenMap::default();
+        let mut plaintext = 0usize;
+        for (key, spec) in &self.tokens {
+            let entry = TokenEntry {
+                role: spec.role().to_string(),
+                expires: spec.expires(),
+            };
+            let hash = match key.strip_prefix(HASH_PREFIX) {
+                Some(hex) => {
+                    let hex = hex.to_ascii_lowercase();
+                    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(invalid(format!(
+                            "auth.tokens key '{HASH_PREFIX}{hex}' is not a 64-char hex SHA-256"
+                        )));
+                    }
+                    hex
+                }
+                None => {
+                    plaintext += 1;
+                    sha256_hex(key)
+                }
+            };
+            if !map.insert(hash, entry) {
+                // never echo the token itself into the error/logs
+                return Err(invalid(
+                    "auth.tokens lists the same token twice (plaintext and sha256: \
+                     forms of one token collide)"
+                        .into(),
+                ));
+            }
+        }
+        if plaintext > 0 {
+            tracing::warn!(
+                count = plaintext,
+                "plaintext tokens in auth.tokens — store them hashed instead \
+                 (key 'sha256:<hex>', e.g. `echo -n $TOKEN | shasum -a 256`)"
+            );
+        }
+        Ok(map)
+    }
 }
 
 impl From<ActionSpec> for Action {
@@ -117,6 +208,15 @@ impl ServerConfig {
             cfg = cfg.retention(RetentionPolicy::days(days));
         }
         Ok(cfg)
+    }
+
+    /// The complete hot-reloadable auth view (tokens + grants + query cap).
+    pub fn auth_state(&self) -> std::io::Result<AuthState> {
+        Ok(AuthState {
+            tokens: self.auth.token_map()?,
+            policy: self.permission_policy(),
+            max_concurrent_queries: self.auth.max_concurrent_queries,
+        })
     }
 
     /// Deny-by-default: a token whose role has no grants can do nothing.

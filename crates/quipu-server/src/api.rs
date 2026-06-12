@@ -1,25 +1,102 @@
-use crate::auth::role_for;
+use crate::auth::{role_for, AuthState};
+use crate::config::ServerConfig;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use quipu_core::{Content, CustomColumnDef, EntityInput, LogQuery, TypeSchema, Value};
-use quipu_middleware::{
-    Action, AuditEvent, AuditHandle, MiddlewareError, PermissionPolicy, Role, TargetSpec,
-};
+use quipu_middleware::{Action, AuditEvent, AuditHandle, MiddlewareError, Role, TargetSpec};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone)]
 pub struct AppState {
     pub handle: AuditHandle,
-    /// Bearer token -> role name.
-    pub tokens: Arc<HashMap<String, String>>,
-    /// Same policy the pipeline enforces; the server consults it directly for
-    /// endpoints whose handle methods are not permission-gated (flush).
-    pub policy: Arc<PermissionPolicy>,
+    /// Hot-reloadable auth view (tokens + grants + query cap). All
+    /// permission gating happens here at the HTTP layer — the pipeline runs
+    /// `allow_all` in this binary precisely so a SIGHUP reload of this field
+    /// is the single source of truth.
+    auth: Arc<RwLock<AuthState>>,
+    /// Per-token-hash query semaphores, created lazily; cleared on reload so
+    /// a changed cap takes effect (in-flight permits stay on the old
+    /// semaphores and just drain out).
+    query_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+}
+
+/// One reserved unit of a token's concurrent-query budget.
+pub enum QuerySlot {
+    /// No `max_concurrent_queries` configured.
+    Unlimited,
+    /// Slot held until the permit drops.
+    Acquired(OwnedSemaphorePermit),
+    /// Budget exhausted — the HTTP layer answers 429.
+    Busy,
+}
+
+impl AppState {
+    pub fn new(handle: AuditHandle, auth: AuthState) -> Self {
+        Self {
+            handle,
+            auth: Arc::new(RwLock::new(auth)),
+            query_slots: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Re-read `path` and swap in its `auth` section. On any error (I/O,
+    /// parse, bad token hash) the previous auth state stays in force — a
+    /// botched edit must not lock everyone out of a running server.
+    pub fn reload_auth(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let cfg = ServerConfig::load(path)?;
+        let next = cfg.auth_state()?;
+        let mut auth = self.auth.write().unwrap();
+        // hash-level diff doubles as the issue/revoke audit trail in the
+        // server log, without ever logging token material
+        let added = next
+            .tokens
+            .hashes()
+            .filter(|h| !auth.tokens.contains_hash(h))
+            .count();
+        let removed = auth
+            .tokens
+            .hashes()
+            .filter(|h| !next.tokens.contains_hash(h))
+            .count();
+        if next.max_concurrent_queries != auth.max_concurrent_queries {
+            self.query_slots.lock().unwrap().clear();
+        }
+        *auth = next;
+        tracing::info!(
+            tokens_added = added,
+            tokens_removed = removed,
+            "auth section reloaded"
+        );
+        Ok(())
+    }
+
+    /// Reserve one of the token's concurrent-query slots, keyed by the
+    /// token's SHA-256 hex (see [`crate::auth::sha256_hex`]). Public so tests can occupy
+    /// a slot deterministically.
+    pub fn query_slot(&self, token_hash: &str) -> QuerySlot {
+        let limit = self.auth.read().unwrap().max_concurrent_queries;
+        let Some(limit) = limit else {
+            return QuerySlot::Unlimited;
+        };
+        let semaphore = self
+            .query_slots
+            .lock()
+            .unwrap()
+            .entry(token_hash.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(limit as usize)))
+            .clone();
+        match semaphore.try_acquire_owned() {
+            Ok(permit) => QuerySlot::Acquired(permit),
+            Err(_) => QuerySlot::Busy,
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -93,9 +170,28 @@ fn internal(msg: impl Into<String>) -> ApiError {
     }
 }
 
+struct Caller {
+    role: Role,
+    /// SHA-256 hex of the presented token — the per-token rate-limit key.
+    token_hash: String,
+}
+
 impl AppState {
-    fn authenticate(&self, headers: &HeaderMap) -> Result<Role, ApiError> {
-        role_for(headers, &self.tokens).ok_or_else(unauthorized)
+    /// Authenticate the bearer token (existence + expiry) and check the
+    /// role's grant in one step, against the current (possibly reloaded)
+    /// auth state.
+    fn authorize(&self, headers: &HeaderMap, action: Action) -> Result<Caller, ApiError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before 1970")
+            .as_secs();
+        let auth = self.auth.read().unwrap();
+        let (role, token_hash) =
+            role_for(headers, &auth.tokens, now).ok_or_else(unauthorized)?;
+        if !auth.policy.is_allowed(&role, action) {
+            return Err(MiddlewareError::PermissionDenied { role, action }.into());
+        }
+        Ok(Caller { role, token_hash })
     }
 }
 
@@ -121,7 +217,7 @@ async fn define_type(
     headers: HeaderMap,
     Json(schema): Json<TypeSchema>,
 ) -> Result<StatusCode, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Administer)?.role;
     let handle = state.handle.clone();
     blocking(move || handle.define_type(&role, schema)).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -131,7 +227,7 @@ async fn list_types(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<TypeSchema>>, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Query)?.role;
     let handle = state.handle.clone();
     Ok(Json(blocking(move || handle.entity_types(&role)).await?))
 }
@@ -141,7 +237,7 @@ async fn define_column(
     headers: HeaderMap,
     Json(def): Json<CustomColumnDef>,
 ) -> Result<StatusCode, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Administer)?.role;
     let handle = state.handle.clone();
     blocking(move || handle.define_custom_column(&role, def)).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -171,7 +267,7 @@ async fn append_log(
     headers: HeaderMap,
     Json(req): Json<AppendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Emit)?.role;
     let mut event = AuditEvent::new(req.actor_type, req.actor, req.method, req.url, req.content);
     if let Some(at) = req.occurred_at {
         event.occurred_at = at;
@@ -191,7 +287,19 @@ async fn query_logs(
     headers: HeaderMap,
     Json(q): Json<LogQuery>,
 ) -> Result<Json<Vec<quipu_core::LogView>>, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let caller = state.authorize(&headers, Action::Query)?;
+    // queries are full scans — hold one of the token's slots for the whole
+    // scan so a single token cannot monopolise the blocking pool
+    let _slot = match state.query_slot(&caller.token_hash) {
+        QuerySlot::Busy => {
+            return Err(ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "too many concurrent queries for this token".into(),
+            })
+        }
+        slot => slot,
+    };
+    let role = caller.role;
     let handle = state.handle.clone();
     // the scan runs on the snapshot in the blocking pool; appends keep flowing
     Ok(Json(blocking(move || handle.query(&role, q)).await?))
@@ -211,7 +319,7 @@ async fn list_entities(
     Path(type_name): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<quipu_core::TargetSnapshot>>, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Query)?.role;
     let handle = state.handle.clone();
     Ok(Json(
         blocking(move || handle.list_entities(&role, type_name, params.include_deleted)).await?,
@@ -223,7 +331,7 @@ async fn entity_history(
     headers: HeaderMap,
     Path((type_name, entity_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<quipu_core::TargetSnapshot>>, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Query)?.role;
     let handle = state.handle.clone();
     Ok(Json(
         blocking(move || handle.entity_history(&role, type_name, entity_id)).await?,
@@ -236,16 +344,7 @@ async fn admin_flush(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let role = state.authenticate(&headers)?;
-    // AuditHandle::flush is ungated (embedded hosts flush their own store);
-    // over the network it is an admin lever, so gate it here
-    if !state.policy.is_allowed(&role, Action::Administer) {
-        return Err(MiddlewareError::PermissionDenied {
-            role,
-            action: Action::Administer,
-        }
-        .into());
-    }
+    state.authorize(&headers, Action::Administer)?;
     let handle = state.handle.clone();
     blocking(move || handle.flush()).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -255,7 +354,7 @@ async fn admin_redrive(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Administer)?.role;
     let handle = state.handle.clone();
     let n = blocking(move || handle.redrive_dlq(&role)).await?;
     Ok(Json(serde_json::json!({ "redriven": n })))
@@ -265,7 +364,7 @@ async fn admin_retention(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Administer)?.role;
     let handle = state.handle.clone();
     let n = blocking(move || handle.apply_retention(&role)).await?;
     Ok(Json(serde_json::json!({ "segments_dropped": n })))
@@ -275,7 +374,7 @@ async fn admin_dlq(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let role = state.authenticate(&headers)?;
+    let role = state.authorize(&headers, Action::Administer)?.role;
     let handle = state.handle.clone();
     let n = blocking(move || handle.dlq_len(&role)).await?;
     Ok(Json(serde_json::json!({ "parked": n })))

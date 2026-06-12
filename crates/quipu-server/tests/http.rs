@@ -4,13 +4,26 @@ use axum::Router;
 use http_body_util::BodyExt;
 use quipu_core::{AuditStore, KeyRing, StoreConfig, SyncPolicy};
 use quipu_middleware::{Action, AuditPipeline, PermissionPolicy, PipelineConfig, Role};
-use quipu_server::{router, AppState};
+use quipu_server::config::AuthSection;
+use quipu_server::{router, sha256_hex, AppState, AuthState, QuerySlot};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tower::ServiceExt;
 
-fn test_app(root: &std::path::Path) -> (Router, AuditPipeline) {
+fn default_tokens() -> Value {
+    json!({
+        "admin-token": "admin",
+        "writer-token": "writer",
+        "reader-token": "reader"
+    })
+}
+
+/// Pipeline runs `allow_all` and the AppState policy enforces, mirroring
+/// main.rs (the policy must live HTTP-side to be hot-reloadable).
+fn test_state(
+    root: &std::path::Path,
+    tokens: Value,
+    max_concurrent_queries: Option<u32>,
+) -> (AppState, AuditPipeline) {
     let keys = KeyRing::new().with_hmac_key(b"test-hmac-key");
     let store = AuditStore::open(
         StoreConfig::new(root)
@@ -28,24 +41,34 @@ fn test_app(root: &std::path::Path) -> (Router, AuditPipeline) {
     let pipeline = AuditPipeline::start(
         store,
         root.to_path_buf(),
-        policy.clone(),
+        PermissionPolicy::allow_all(),
         PipelineConfig::default(),
         None,
     )
     .unwrap();
-    let tokens: HashMap<String, String> = [
-        ("admin-token", "admin"),
-        ("writer-token", "writer"),
-        ("reader-token", "reader"),
-    ]
-    .into_iter()
-    .map(|(t, r)| (t.to_string(), r.to_string()))
-    .collect();
-    let state = AppState {
-        handle: pipeline.handle(),
-        tokens: Arc::new(tokens),
-        policy: Arc::new(policy),
-    };
+    let auth: AuthSection = serde_json::from_value(json!({
+        "tokens": tokens,
+        "grants": {
+            "admin": ["emit", "query", "administer"],
+            "writer": ["emit"],
+            "reader": ["query"]
+        },
+        "max_concurrent_queries": max_concurrent_queries
+    }))
+    .unwrap();
+    let state = AppState::new(
+        pipeline.handle(),
+        AuthState {
+            tokens: auth.token_map().unwrap(),
+            policy,
+            max_concurrent_queries,
+        },
+    );
+    (state, pipeline)
+}
+
+fn test_app(root: &std::path::Path) -> (Router, AuditPipeline) {
+    let (state, pipeline) = test_state(root, default_tokens(), None);
     (router(state), pipeline)
 }
 
@@ -288,6 +311,171 @@ async fn auth_and_permission_errors() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, body) = send(&app, "GET", "/v1/admin/dlq", Some("admin-token"), None).await;
     assert_eq!(body["parked"], 1);
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn hashed_token_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = "hush-token";
+    let mut tokens = serde_json::Map::new();
+    tokens.insert(format!("sha256:{}", sha256_hex(raw)), json!("reader"));
+    let (state, pipeline) = test_state(dir.path(), Value::Object(tokens), None);
+    let app = router(state);
+
+    // the raw token authenticates against its stored hash
+    let (status, body) = send(&app, "POST", "/v1/logs/query", Some(raw), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // the hash itself is not a credential
+    let hash = sha256_hex(raw);
+    let (status, _) = send(&app, "POST", "/v1/logs/query", Some(&hash), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn expired_token_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let tokens = json!({
+        "stale-token": { "role": "reader", "expires": 1 },
+        "fresh-token": { "role": "reader", "expires": now + 3600 }
+    });
+    let (state, pipeline) = test_state(dir.path(), tokens, None);
+    let app = router(state);
+
+    // expired token behaves exactly like an unknown one
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("stale-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("fresh-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn concurrent_query_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, pipeline) = test_state(dir.path(), default_tokens(), Some(1));
+    let app = router(state.clone());
+
+    // occupy reader's only slot, as an in-flight query would
+    let held = state.query_slot(&sha256_hex("reader-token"));
+    assert!(matches!(held, QuerySlot::Acquired(_)));
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // the cap is per token: another token still gets through
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("admin-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // releasing the slot frees the budget
+    drop(held);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn auth_reload_swaps_tokens_and_survives_bad_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_root = dir.path().join("store");
+    std::fs::create_dir_all(&store_root).unwrap();
+    let (state, pipeline) = test_state(&store_root, default_tokens(), None);
+    let app = router(state.clone());
+
+    let cfg_path = dir.path().join("config.json");
+    std::fs::write(
+        &cfg_path,
+        json!({
+            "listen": "127.0.0.1:0",
+            "store": { "root": dir.path().join("store") },
+            "auth": {
+                "tokens": { "rotated-token": "reader" },
+                "grants": { "reader": ["query"] }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    state.reload_auth(&cfg_path).unwrap();
+
+    // revoked token is out, rotated one is in
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("rotated-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // a broken config file must not change anything
+    std::fs::write(&cfg_path, "{ not json").unwrap();
+    assert!(state.reload_auth(&cfg_path).is_err());
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("rotated-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     pipeline.shutdown();
 }

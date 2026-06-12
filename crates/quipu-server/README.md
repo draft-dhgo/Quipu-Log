@@ -43,15 +43,19 @@ cargo run -p quipu-server -- config.json
   },
   "auth": {
     "tokens": {
-      "s3rv1ce-a-t0ken": "writer",
-      "aud1tor-t0ken": "reader",
+      "sha256:4d41854aa8c3af67915fd2808c9060f711ce4ca8f85c77120b7f393b2685b817": "writer",
+      "sha256:00fd2eabbe5cdebba9140e6b6516695e313b825400d79812013ace3c5101a073": {
+        "role": "reader",
+        "expires": 1790000000
+      },
       "adm1n-t0ken": "admin"
     },
     "grants": {
       "writer": ["emit"],
       "reader": ["query"],
       "admin": ["emit", "query", "administer"]
-    }
+    },
+    "max_concurrent_queries": 2
   }
 }
 ```
@@ -60,6 +64,45 @@ cargo run -p quipu-server -- config.json
 - Key material is always referenced by file path, never inlined.
 - Auth is deny-by-default: a role with no grants can do nothing.
   Run one token per calling service so tokens can be revoked individually.
+
+### Token management
+
+Store tokens **hashed**: a `sha256:<hex>` key holds the SHA-256 of the
+token, so the config file itself is not a credential. Generate the hex with:
+
+```sh
+echo -n "$TOKEN" | shasum -a 256
+```
+
+Plaintext keys keep working (the server hashes them at load time and never
+holds the raw token in memory afterwards), but each load logs a warning —
+treat them as a migration path, not a destination.
+
+A token's value is either a bare role name or
+`{"role": ..., "expires": <unix epoch seconds>}`
+(`date -d '+90 days' +%s` on Linux, `date -v+90d +%s` on macOS).
+At or past `expires` the token is rejected exactly like an unknown one:
+a plain 401, no hint that it ever existed.
+
+**Hot reload.** Send `SIGHUP` to re-read the config file and swap the
+`auth` section — tokens, grants, and `max_concurrent_queries` — without a
+restart or dropped connections:
+
+```sh
+kill -HUP "$(pgrep -f quipu-server)"
+```
+
+Each reload logs how many tokens were added and removed, so the server log
+doubles as the issue/revoke audit trail (token material itself is never
+logged). A reload that fails — unreadable file, parse error, malformed
+`sha256:` key — keeps the previous auth config in force and logs an error.
+The other sections (`listen`, `store`, `keys`) still require a restart.
+
+**Per-token query cap.** Queries are full scans, so one token must not be
+able to monopolise the CPU: `auth.max_concurrent_queries` caps how many
+queries each token may have running at once (omit it for no cap). A token
+at its cap gets **429** on further queries — retry once the running ones
+finish. Appends are unaffected.
 
 ### Key boundary
 
@@ -79,8 +122,9 @@ at the cost of the server being able to read them.
 ## HTTP API
 
 All endpoints except `/v1/healthz` require `Authorization: Bearer <token>`.
-Errors are `{"error": "<message>"}` with 401 (missing/unknown token),
+Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
 403 (role lacks the action), 400 (schema/crypto misuse), 404,
+429 (token at its concurrent-query cap — retry when a query finishes),
 503 (append queue full — back off and retry), or 500.
 
 | method & path | action | body / response |

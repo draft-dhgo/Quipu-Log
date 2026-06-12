@@ -1,7 +1,6 @@
 use quipu_core::AuditStore;
-use quipu_middleware::{AuditPipeline, PipelineConfig};
+use quipu_middleware::{AuditPipeline, PermissionPolicy, PipelineConfig};
 use quipu_server::{router, AppState, ServerConfig};
-use std::sync::Arc;
 
 fn usage() -> ! {
     eprintln!("usage: quipu-server <config.json>");
@@ -44,10 +43,14 @@ async fn main() {
         }
     };
 
+    // the pipeline is only reachable through the HTTP handlers here, and
+    // those gate every call against the hot-reloadable AppState policy — so
+    // the pipeline's own (start-time-frozen) policy must not also enforce,
+    // or a SIGHUP grant change could never take effect
     let pipeline = match AuditPipeline::start(
         store,
         store_root,
-        cfg.permission_policy(),
+        PermissionPolicy::allow_all(),
         PipelineConfig::default(),
         None,
     ) {
@@ -58,11 +61,38 @@ async fn main() {
         }
     };
 
-    let state = AppState {
-        handle: pipeline.handle(),
-        tokens: Arc::new(cfg.auth.tokens.clone()),
-        policy: Arc::new(cfg.permission_policy()),
+    let auth_state = match cfg.auth_state() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("invalid auth config: {e}");
+            std::process::exit(1);
+        }
     };
+    let state = AppState::new(pipeline.handle(), auth_state);
+
+    // SIGHUP = re-read the config file and swap the auth section (token
+    // issue/revoke without dropping connections); reload failures keep the
+    // previous auth state
+    #[cfg(unix)]
+    {
+        let state = state.clone();
+        let path = std::path::PathBuf::from(&config_path);
+        tokio::spawn(async move {
+            let mut hup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "cannot install SIGHUP handler; auth hot-reload disabled");
+                        return;
+                    }
+                };
+            while hup.recv().await.is_some() {
+                if let Err(e) = state.reload_auth(&path) {
+                    tracing::error!(error = %e, "auth reload failed; keeping previous auth config");
+                }
+            }
+        });
+    }
 
     let listener = match tokio::net::TcpListener::bind(&cfg.listen).await {
         Ok(l) => l,

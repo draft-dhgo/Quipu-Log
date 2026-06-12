@@ -774,6 +774,7 @@ dependencies = [
  "quipu-middleware",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tower",
