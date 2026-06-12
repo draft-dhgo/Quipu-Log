@@ -55,7 +55,8 @@ store.define_type(TypeSchema::new("patient", vec![
 (`default_target` and `default_actor` ship out of the box if you don't need
 custom schemas.)
 
-Each field picks its own protection level:
+Each field picks its own protection level. The default is `None` — plaintext
+on disk; protection is opt-in per field, there is no store-wide switch:
 
 - `Sha256`, one-way hash that's still searchable, because query probes get
   hashed the same way. No key to manage. The catch: low-entropy values like
@@ -65,6 +66,13 @@ Each field picks its own protection level:
 - `Rsa`, hybrid AES-256-GCM with RSA-OAEP key wrapping. Decryptable with the
   private key, not searchable, and authenticated, an in-place edit makes
   decryption fail.
+
+Protection only covers registry *fields*. Everything else is always plaintext:
+`entity_id`, the log's `method`/`url`/`content`, and custom columns — those
+are what queries filter and render on. The practical consequence: model
+sensitive values as protected registry fields, and keep them out of
+`entity_id` (use an opaque id, not an SSN) and out of `content` (the
+request/response dump is the easiest place to leak PII by accident).
 
 Protection decides what a query can do: hashed fields are exact-match only,
 RSA fields need a full decrypt-scan. If a protected field needs richer search
