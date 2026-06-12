@@ -69,7 +69,7 @@ HTTP 서비스라면 4번 대신 [`tower` 프록시
 |---|---|
 | `quipu-core` | 스토리지 엔진, 타입별 레지스트리, 필드 암호화, 보존 정책, 쿼리 |
 | `quipu-middleware` | 이벤트 파이프라인(DLQ/폴백), pre/post 필터, 권한, `tower` 프록시 레이어 |
-| `quipu-server` | 독립 데몬: 동일한 스토어를 토큰 인증 HTTP/JSON API 뒤에 두는 중앙 집중형 멀티 서비스 배포용 (해당 [README](crates/quipu-server/README.md) 참고) |
+| `quipu-server` | 독립 데몬: 동일한 스토어를 토큰 인증 HTTP/JSON API 뒤에 두는 중앙 집중형 멀티 서비스 배포용 |
 | `examples/axum-demo` | 실행 가능한 axum 연동 예제 |
 
 ## 데이터 모델

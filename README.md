@@ -68,7 +68,7 @@ A complete runnable setup lives in [`examples/axum-demo`](examples/axum-demo).
 |---|---|
 | `quipu-core` | storage engine, typed registries, field encryption, retention, queries |
 | `quipu-middleware` | event pipeline (DLQ/fallback), pre/post filters, permissions, `tower` proxy layer |
-| `quipu-server` | standalone daemon: the same store behind a token-authenticated HTTP/JSON API, for central multi-service deployments (see its [README](crates/quipu-server/README.md)) |
+| `quipu-server` | standalone daemon: the same store behind a token-authenticated HTTP/JSON API, for central multi-service deployments |
 | `examples/axum-demo` | runnable axum integration |
 
 ## Data model
