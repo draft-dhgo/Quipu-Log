@@ -31,6 +31,7 @@ Some things that make it different from "just log JSON somewhere":
 |---|---|
 | `quipu-core` | storage engine, typed registries, field encryption, retention, queries |
 | `quipu-middleware` | event pipeline (DLQ/fallback), pre/post filters, permissions, `tower` proxy layer |
+| `quipu-server` | standalone daemon: the same store behind a token-authenticated HTTP/JSON API, for central multi-service deployments (see its [README](crates/quipu-server/README.md)) |
 | `examples/axum-demo` | runnable axum integration |
 
 ## The data model

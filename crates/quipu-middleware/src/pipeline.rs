@@ -1,7 +1,9 @@
 use crate::event::AuditEvent;
 use crate::permissions::{Action, PermissionPolicy, Role};
 use quipu_core::storage::Table;
-use quipu_core::{AuditStore, LogQuery, LogView, ReadSnapshot, TargetSnapshot, TypeSchema, Uid};
+use quipu_core::{
+    AuditStore, CustomColumnDef, LogQuery, LogView, ReadSnapshot, TargetSnapshot, TypeSchema, Uid,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -90,6 +92,14 @@ enum Command {
         type_name: String,
         entity_id: String,
         reply: SyncSender<Result<Vec<TargetSnapshot>, MiddlewareError>>,
+    },
+    DefineType {
+        schema: TypeSchema,
+        reply: SyncSender<Result<(), MiddlewareError>>,
+    },
+    DefineCustomColumn {
+        def: CustomColumnDef,
+        reply: SyncSender<Result<(), MiddlewareError>>,
     },
     Flush(SyncSender<Result<(), MiddlewareError>>),
     RedriveDlq(SyncSender<Result<usize, MiddlewareError>>),
@@ -198,6 +208,26 @@ impl AuditHandle {
             entity_id,
             reply,
         })
+    }
+
+    /// Create (or additively redefine) the registry table for an entity/actor
+    /// type (permission-gated, [`Action::Administer`]). Server-mode clients
+    /// need this — in embedded mode the host defines types before the
+    /// pipeline starts, but a remote client only ever talks to the handle.
+    pub fn define_type(&self, role: &Role, schema: TypeSchema) -> Result<(), MiddlewareError> {
+        self.check(role, Action::Administer)?;
+        self.round_trip(|reply| Command::DefineType { schema, reply })
+    }
+
+    /// Register an extra audit-log column (permission-gated,
+    /// [`Action::Administer`]) — see [`AuditStore::define_custom_column`].
+    pub fn define_custom_column(
+        &self,
+        role: &Role,
+        def: CustomColumnDef,
+    ) -> Result<(), MiddlewareError> {
+        self.check(role, Action::Administer)?;
+        self.round_trip(|reply| Command::DefineCustomColumn { def, reply })
     }
 
     /// Wait until every event enqueued so far is durably on disk.
@@ -383,6 +413,20 @@ impl Worker {
                 let res = self
                     .store
                     .entity_history(&type_name, &entity_id)
+                    .map_err(MiddlewareError::Core);
+                let _ = reply.send(res);
+            }
+            Command::DefineType { schema, reply } => {
+                let res = self
+                    .store
+                    .define_type(schema)
+                    .map_err(MiddlewareError::Core);
+                let _ = reply.send(res);
+            }
+            Command::DefineCustomColumn { def, reply } => {
+                let res = self
+                    .store
+                    .define_custom_column(def)
                     .map_err(MiddlewareError::Core);
                 let _ = reply.send(res);
             }

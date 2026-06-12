@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// How a [`TargetFilter`] compares the probe value against stored values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatchMode {
     #[default]
     Exact,
@@ -28,7 +29,7 @@ pub enum MatchMode {
 }
 
 /// Search condition against a target entity's registry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetFilter {
     pub entity_type: String,
     pub field: String,
@@ -37,8 +38,14 @@ pub struct TargetFilter {
     /// renamed entity is still found by its old name, and a search by the
     /// current name also returns logs written before the rename).
     /// `false`: only entities whose latest, non-deleted version matches.
+    #[serde(default = "default_include_past")]
     pub include_past: bool,
+    #[serde(default)]
     pub mode: MatchMode,
+}
+
+fn default_include_past() -> bool {
+    true
 }
 
 impl TargetFilter {
@@ -79,7 +86,8 @@ impl TargetFilter {
 }
 
 /// Declarative log query. All set conditions are AND-ed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogQuery {
     /// Inclusive UTC-micros range.
     pub from_micros: Option<u64>,

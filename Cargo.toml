@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/quipu-core",
     "crates/quipu-middleware",
+    "crates/quipu-server",
     "examples/axum-demo",
 ]
 

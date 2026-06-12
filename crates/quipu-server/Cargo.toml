@@ -1,0 +1,22 @@
+[package]
+name = "quipu-server"
+description = "Standalone audit-log daemon over quipu-core: central append/query HTTP API for polyglot, multi-service deployments."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+quipu-core = { path = "../quipu-core" }
+quipu-middleware = { path = "../quipu-middleware" }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { workspace = true }
+http-body-util = { workspace = true }
