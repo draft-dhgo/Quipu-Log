@@ -80,16 +80,25 @@ pub enum StoredValue {
     /// [`crate::schema::FieldProtection::Sha256`]).
     Sha256(String),
     /// HMAC-SHA-256 of the canonical bytes (hex), keyed with the store's HMAC
-    /// key. Still searchable: queries MAC the probe value with the same key
-    /// and compare digests. The original is unrecoverable by design, and
-    /// without the key the digest cannot be brute-forced from disk.
-    Hmac(String),
+    /// key of `key_version`. Still searchable: queries MAC the probe value
+    /// under every held key version and compare digests. The original is
+    /// unrecoverable by design, and without the key the digest cannot be
+    /// brute-forced from disk.
+    Hmac {
+        /// [`crate::crypto::KeyVersion`] of the HMAC key the digest was made
+        /// with — recorded at write time so probes survive key rotations.
+        key_version: u32,
+        digest: String,
+    },
     /// Hybrid encryption: the value is AES-256-GCM encrypted under a random
     /// data key, which is RSA-OAEP(SHA-256) wrapped with the store's public
-    /// key. Recoverable with the private key via
+    /// key of `key_version`. Recoverable with that version's private key via
     /// [`crate::crypto::KeyRing::decrypt`]; not searchable. GCM authenticates
     /// the ciphertext, so any in-place modification fails decryption.
     Rsa {
+        /// [`crate::crypto::KeyVersion`] of the RSA keypair whose public key
+        /// wrapped the data key — names the private key that can unwrap it.
+        key_version: u32,
         wrapped_key: String,
         nonce: String,
         ciphertext: String,

@@ -53,7 +53,17 @@ pub struct RegistryRecord {
     /// what keeps protected fields prefix/substring-searchable across
     /// restarts — the plaintext is not on disk to re-derive them from.
     #[serde(default)]
-    pub tokens: BTreeMap<String, Vec<String>>,
+    pub tokens: BTreeMap<String, FieldTokens>,
+}
+
+/// The persisted blind-index token set of one field of one record version.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FieldTokens {
+    /// [`crate::crypto::KeyVersion`] of the HMAC key the digests were made
+    /// with ([`crate::crypto::KEYLESS`] for keyless protections). Recorded so
+    /// probes — and the re-key tool — know which key these digests answer to.
+    pub key_version: u32,
+    pub digests: Vec<String>,
 }
 
 /// The in-memory, queryable side of one type's registry: version maps, search
@@ -119,9 +129,9 @@ impl RegistryIndex {
                     .insert(rec.entity_id.clone());
             }
         }
-        for (field, digests) in &rec.tokens {
+        for (field, tokens) in &rec.tokens {
             let posting = self.token_index.entry(field.clone()).or_default();
-            for d in digests {
+            for d in &tokens.digests {
                 posting
                     .entry(d.clone())
                     .or_default()
@@ -156,27 +166,50 @@ impl RegistryIndex {
                 if !def.indexed {
                     return Err(Error::Schema(format!("field '{field}' is not indexed")));
                 }
-                let key = match def.protection {
-                    FieldProtection::None => probe.canonical_bytes(),
-                    FieldProtection::Sha256 => sha256_hex(&probe.canonical_bytes()).into_bytes(),
-                    FieldProtection::Hmac => keys.hmac_hex(&probe.canonical_bytes())?.into_bytes(),
+                // one probe key per held key version: a digest only ever
+                // matches records written under the same key, so OR-ing the
+                // per-version lookups is exact (keyless protections probe once)
+                let probe_keys: Vec<Vec<u8>> = match def.protection {
+                    FieldProtection::None => vec![probe.canonical_bytes()],
+                    FieldProtection::Sha256 => {
+                        vec![sha256_hex(&probe.canonical_bytes()).into_bytes()]
+                    }
+                    FieldProtection::Hmac => {
+                        let versions = keys.hmac_versions();
+                        if versions.is_empty() {
+                            return Err(Error::Crypto(
+                                "HMAC field declared but no HMAC key configured".into(),
+                            ));
+                        }
+                        versions
+                            .into_iter()
+                            .map(|v| {
+                                Ok(keys.hmac_hex_with(v, &probe.canonical_bytes())?.into_bytes())
+                            })
+                            .collect::<Result<_>>()?
+                    }
                     FieldProtection::Rsa => unreachable!("rsa fields are rejected at open()"),
                 };
-                let Some(ids) = self.index.get(field).and_then(|m| m.get(&key)) else {
-                    return Ok(Vec::new());
-                };
+                let mut hits: HashSet<String> = HashSet::new();
+                for key in &probe_keys {
+                    if let Some(ids) = self.index.get(field).and_then(|m| m.get(key)) {
+                        hits.extend(ids.iter().cloned());
+                    }
+                }
                 let mut out: Vec<String> = if include_past {
-                    ids.iter().cloned().collect()
+                    hits.into_iter().collect()
                 } else {
-                    ids.iter()
+                    hits.into_iter()
                         .filter(|id| {
                             self.latest(id).is_some_and(|rec| {
                                 !rec.deleted
-                                    && rec.fields.get(field).and_then(index_key).as_deref()
-                                        == Some(&key[..])
+                                    && rec
+                                        .fields
+                                        .get(field)
+                                        .and_then(index_key)
+                                        .is_some_and(|k| probe_keys.contains(&k))
                             })
                         })
-                        .cloned()
                         .collect()
                 };
                 out.sort();
@@ -185,8 +218,7 @@ impl RegistryIndex {
             MatchMode::ExactCi => {
                 let norm = tokens::normalize(&probe_text(probe));
                 if def.search == FieldIndex::Exact {
-                    let d = keys.index_token_digest(&def.name, def.protection, &norm)?;
-                    return Ok(self.token_candidates(&def.name, &[d], include_past));
+                    return self.token_match(&def, &[norm], include_past, keys);
                 }
                 self.scan_matching(field, &def, include_past, keys, None, |hay| {
                     tokens::normalize(&String::from_utf8_lossy(hay)) == norm
@@ -197,8 +229,7 @@ impl RegistryIndex {
                 if let FieldIndex::Prefix(n) = def.search {
                     let plen = norm.chars().count();
                     if (1..=n).contains(&plen) {
-                        let d = keys.index_token_digest(&def.name, def.protection, &norm)?;
-                        return Ok(self.token_candidates(&def.name, &[d], include_past));
+                        return self.token_match(&def, &[norm], include_past, keys);
                     }
                     // probe longer than the declared prefix depth: fall back
                     // to the plaintext scan below (plain fields always work;
@@ -211,11 +242,7 @@ impl RegistryIndex {
             MatchMode::Contains => {
                 if let FieldIndex::Ngram(n) = def.search {
                     if let Some(toks) = tokens::ngram_probe_tokens(&probe_text(probe), n) {
-                        let digests: Vec<String> = toks
-                            .iter()
-                            .map(|t| keys.index_token_digest(&def.name, def.protection, t))
-                            .collect::<Result<_>>()?;
-                        let candidates = self.token_candidates(&def.name, &digests, include_past);
+                        let candidates = self.token_match(&def, &toks, include_past, keys)?;
                         let norm = tokens::normalize(&probe_text(probe));
                         return match def.protection {
                             // plaintext at hand: confirm the real substring
@@ -261,6 +288,53 @@ impl RegistryIndex {
         }
     }
 
+    /// Token-index match of normalized probe tokens, across every held key
+    /// version. For keyed fields the digests are recomputed per HMAC key
+    /// version and the per-version candidate sets are OR-ed: a record's
+    /// tokens were all digested under one key, so a digest only matches
+    /// records written under that key and the union is exact. Keyless fields
+    /// probe once.
+    fn token_match(
+        &self,
+        def: &FieldDef,
+        probe_tokens: &[String],
+        include_past: bool,
+        keys: &KeyRing,
+    ) -> Result<Vec<String>> {
+        let digest_sets: Vec<Vec<String>> = match def.protection {
+            FieldProtection::None | FieldProtection::Sha256 => vec![probe_tokens
+                .iter()
+                .map(|t| {
+                    keys.index_token_digest_with(crate::crypto::KEYLESS, &def.name, def.protection, t)
+                })
+                .collect::<Result<_>>()?],
+            FieldProtection::Hmac | FieldProtection::Rsa => {
+                let versions = keys.hmac_versions();
+                if versions.is_empty() {
+                    return Err(Error::Crypto(
+                        "HMAC field declared but no HMAC key configured".into(),
+                    ));
+                }
+                versions
+                    .into_iter()
+                    .map(|v| {
+                        probe_tokens
+                            .iter()
+                            .map(|t| keys.index_token_digest_with(v, &def.name, def.protection, t))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<_>>()?
+            }
+        };
+        let mut out: Vec<String> = Vec::new();
+        for digests in &digest_sets {
+            out.extend(self.token_candidates(&def.name, digests, include_past));
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Entities with a version whose blind-index token set covers *all*
     /// `digests` (the per-record check keeps tokens of different versions
     /// from being combined into a phantom match). `include_past = false`
@@ -286,7 +360,7 @@ impl RegistryIndex {
             self.by_uid[uid]
                 .tokens
                 .get(field)
-                .is_some_and(|t| digests.iter().all(|d| t.contains(d)))
+                .is_some_and(|t| digests.iter().all(|d| t.digests.contains(d)))
         };
         let mut out: Vec<String> = ids
             .into_iter()
@@ -361,7 +435,7 @@ impl RegistryIndex {
         };
         match stored {
             StoredValue::Plain(v) => Ok(Some(v.canonical_bytes())),
-            StoredValue::Sha256(_) | StoredValue::Hmac(_) => {
+            StoredValue::Sha256(_) | StoredValue::Hmac { .. } => {
                 Ok(self.held.get(&(uid, field.to_string())).cloned())
             }
             StoredValue::Rsa { .. } => {
@@ -487,11 +561,20 @@ impl TypeRegistry {
                 // exists — for protected fields it is not on disk to re-derive
                 if def.search != FieldIndex::None {
                     if let Value::Text(s) = v {
-                        let digests = tokens::value_tokens(s, def.search)
-                            .iter()
-                            .map(|t| keys.index_token_digest(&def.name, def.protection, t))
-                            .collect::<Result<Vec<_>>>()?;
-                        token_map.insert(def.name.clone(), digests);
+                        let mut key_version = crate::crypto::KEYLESS;
+                        let mut digests = Vec::new();
+                        for t in tokens::value_tokens(s, def.search) {
+                            let (v, d) = keys.index_token_digest(&def.name, def.protection, &t)?;
+                            key_version = v; // same active key for every token
+                            digests.push(d);
+                        }
+                        token_map.insert(
+                            def.name.clone(),
+                            FieldTokens {
+                                key_version,
+                                digests,
+                            },
+                        );
                     }
                 }
                 // hold the plaintext in memory so protected fields written by
@@ -626,7 +709,8 @@ impl TypeRegistry {
 fn index_key(stored: &StoredValue) -> Option<Vec<u8>> {
     match stored {
         StoredValue::Plain(v) => Some(v.canonical_bytes()),
-        StoredValue::Sha256(hex) | StoredValue::Hmac(hex) => Some(hex.as_bytes().to_vec()),
+        StoredValue::Sha256(hex) => Some(hex.as_bytes().to_vec()),
+        StoredValue::Hmac { digest, .. } => Some(digest.as_bytes().to_vec()),
         StoredValue::Rsa { .. } => None,
     }
 }
