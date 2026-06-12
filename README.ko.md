@@ -185,6 +185,30 @@ HTTP를 거치지 않고 직접 이벤트를 발행할 수도 있습니다:
 handle.emit(&Role::new("svc"), AuditEvent::new(...).target(...))?;  // 논블로킹
 ```
 
+## 서버 모드: 중앙 집중형 배포
+
+지금까지의 내용은 모두 *임베디드* 실행 — 스토어가 서비스 프로세스 안에
+사는 방식입니다. `quipu-server`는 같은 엔진을 돌리는 두 번째 방법입니다:
+스토어를 비동기 파이프라인으로 감싸 토큰 인증 HTTP/JSON API로 노출하는
+독립 데몬으로, 언어에 상관없이 여러 서비스가 감사 로그를 중앙에서
+기록·검색할 수 있습니다(Elasticsearch 스타일의 배포 형태).
+
+```
+service A ──┐                       ┌── root/logs
+service B ──┼── HTTP ── quipu-server┼── root/registry/<type>
+auditor  ───┘   (bearer tokens)     └── root/dlq, ...
+```
+
+스토어는 여전히 단일 프로세스 전용이고, 그 프로세스가 바로 이 데몬입니다.
+인증은 기본 거부(deny-by-default)에 토큰별 역할 권한을 부여하는 방식이며,
+서버를 *쓰기 전용*으로 운영할 수도 있습니다 — RSA 개인 키 없이 띄우면
+암호화 필드를 저장은 하되 조회 시 암호문 그대로 반환하고 클라이언트가
+로컬에서 복호화합니다. 평문 복원 능력을 서버의 피해 반경 밖에 두는
+구성입니다.
+
+설정 방법, 전체 HTTP API, v1 제약 사항은 [quipu-server
+README](crates/quipu-server/README.md)에 정리되어 있습니다.
+
 ## 쿼리
 
 ```rust

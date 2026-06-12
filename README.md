@@ -185,6 +185,30 @@ You can also skip HTTP entirely and emit events yourself:
 handle.emit(&Role::new("svc"), AuditEvent::new(...).target(...))?;  // non-blocking
 ```
 
+## Server mode: central deployments
+
+Everything above runs *embedded* — the store lives inside your service's
+process. `quipu-server` is a second way to run the same engine: a standalone
+daemon that wraps the store in the async pipeline and exposes it over a
+token-authenticated HTTP/JSON API, so multiple services — in any language —
+can record and search audit logs centrally (the Elasticsearch-style
+deployment shape).
+
+```
+service A ──┐                       ┌── root/logs
+service B ──┼── HTTP ── quipu-server┼── root/registry/<type>
+auditor  ───┘   (bearer tokens)     └── root/dlq, ...
+```
+
+The store stays single-process; the daemon is that process. Auth is
+deny-by-default with per-token role grants, and the server can run
+*write-only* — without the RSA private key it stores encrypted fields but
+returns them as ciphertext for clients to decrypt locally, keeping plaintext
+recovery out of the server's blast radius.
+
+Configuration, the full HTTP API, and v1 limits are documented in the
+[quipu-server README](crates/quipu-server/README.md).
+
 ## Querying
 
 ```rust
