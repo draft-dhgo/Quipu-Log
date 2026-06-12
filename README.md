@@ -183,4 +183,4 @@ cargo run -p axum-demo     # then: curl -X PUT localhost:3000/api/docs/42 -H 'x-
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
