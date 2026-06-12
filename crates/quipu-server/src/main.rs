@@ -64,20 +64,21 @@ async fn main() {
         policy: Arc::new(cfg.permission_policy()),
     };
 
-    let listener = match tokio::net::TcpListener::bind(&cfg.listen).await {
+    let listener = match quipu_server::bind(&cfg.listen) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("failed to bind '{}': {e}", cfg.listen);
             std::process::exit(1);
         }
     };
-    tracing::info!(listen = %cfg.listen, "quipu-server listening");
+    tracing::info!(listen = %cfg.listen, tls = cfg.tls.is_some(), "quipu-server listening");
 
-    let serve = axum::serve(listener, router(state)).with_graceful_shutdown(async {
+    let result = quipu_server::serve(listener, cfg.tls.as_ref(), router(state), async {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutdown signal received");
-    });
-    if let Err(e) = serve.await {
+    })
+    .await;
+    if let Err(e) = result {
         tracing::error!(error = %e, "server error");
     }
 

@@ -76,6 +76,38 @@ Configuring the private key (plus `plaintext_cache: true`)
 enables server-side `contains` search on RSA-protected fields,
 at the cost of the server being able to read them.
 
+## TLS
+
+Add a `tls` section and the server terminates TLS itself (rustls):
+
+```json
+"tls": {
+  "cert_pem_file": "/etc/quipu/tls/cert.pem",
+  "key_pem_file": "/etc/quipu/tls/key.pem"
+}
+```
+
+As with `keys`, the certificate and private key are referenced by file path,
+never inlined in the config.
+
+Why direct termination is built in
+instead of being documented away to a reverse proxy:
+every request carries a bearer token and audit payloads (possibly PII),
+so the transport leg sits inside this server's threat model.
+Delegating it to a proxy pushes the trust boundary outside the project,
+and a standalone deployment could no longer keep its security promise on its own.
+
+Running behind a TLS-terminating proxy or a service mesh still works:
+omit the `tls` section and the server speaks plain HTTP as before.
+
+For local testing, generate a self-signed certificate:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost' \
+  -keyout key.pem -out cert.pem
+```
+
 ## HTTP API
 
 All endpoints except `/v1/healthz` require `Authorization: Bearer <token>`.
@@ -171,7 +203,6 @@ Same rules as embedded `define_type`: redefinition is additive only.
   tokens separate *capabilities* (emit/query/admin), not data —
   every reader sees every log.
   Per-tenant isolation would mean per-tenant store roots and is future work.
-- Plain HTTP — put it behind TLS (reverse proxy or a service mesh).
 - No Rust client crate yet;
   the API above is small enough to call with any HTTP client,
   which is the point of choosing JSON over gRPC.

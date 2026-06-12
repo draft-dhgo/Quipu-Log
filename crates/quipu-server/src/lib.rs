@@ -14,6 +14,8 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod serve;
 
 pub use api::{router, AppState};
 pub use config::ServerConfig;
+pub use serve::{bind, serve};

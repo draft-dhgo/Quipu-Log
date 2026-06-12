@@ -14,6 +14,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub keys: KeysSection,
     pub auth: AuthSection,
+    /// Omit to serve plain HTTP (e.g. behind a TLS-terminating proxy).
+    pub tls: Option<TlsSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +51,18 @@ pub struct KeysSection {
     /// RSA private key (PKCS#8 PEM). Optional by design: a write-only server
     /// should not hold it; querying clients then decrypt locally.
     pub private_key_pem_file: Option<PathBuf>,
+}
+
+/// Direct TLS termination. Like [`KeysSection`], key material is referenced
+/// by file path, never inlined: configs travel through chat/tickets/repos
+/// far more often than key files.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsSection {
+    /// Server certificate chain (PEM, leaf first).
+    pub cert_pem_file: PathBuf,
+    /// Private key for the certificate (PKCS#8/PKCS#1/SEC1 PEM).
+    pub key_pem_file: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]

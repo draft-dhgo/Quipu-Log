@@ -79,6 +79,38 @@ cargo run -p quipu-server -- config.json
 RSA 보호 필드도 서버에서 `contains` 검색이 되지만,
 그만큼 서버가 그 값을 읽을 수 있게 됩니다.
 
+## TLS
+
+설정에 `tls` 섹션을 넣으면 서버가 직접 TLS를 종단합니다(rustls).
+
+```json
+"tls": {
+  "cert_pem_file": "/etc/quipu/tls/cert.pem",
+  "key_pem_file": "/etc/quipu/tls/key.pem"
+}
+```
+
+`keys`와 마찬가지로 인증서와 개인 키는 파일 경로로만 참조합니다.
+설정 파일에 직접 넣을 수 없습니다.
+
+"리버스 프록시 뒤에 두세요"라는 문서 한 줄로 끝내지 않고
+직접 종단을 넣은 이유는 이렇습니다.
+모든 요청에 bearer 토큰과 감사 데이터(PII가 섞일 수 있는)가 실려 다니니,
+전송 구간은 이 서버의 위협 모델 안에 있습니다.
+그걸 프록시에 맡기면 신뢰 경계가 프로젝트 바깥으로 밀려나고,
+단독 배포에서는 보안 약속이 자기 힘으로 성립하지 않게 됩니다.
+
+물론 TLS를 종단해 주는 프록시나 서비스 메시 뒤에서 돌리는 것도 여전히 됩니다.
+`tls` 섹션을 빼면 예전처럼 평문 HTTP로 동작합니다.
+
+로컬 테스트용 자가서명 인증서는 이렇게 만듭니다.
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost' \
+  -keyout key.pem -out cert.pem
+```
+
 ## HTTP API
 
 `/v1/healthz`만 빼고 모든 엔드포인트에 `Authorization: Bearer <token>`이 필요합니다.
@@ -178,7 +210,6 @@ curl -s -X POST localhost:7700/v1/types \
   토큰이 가르는 것은 할 수 있는 일(emit/query/admin)이지 볼 수 있는 데이터가 아니라서,
   모든 reader가 모든 로그를 봅니다.
   테넌트 격리는 테넌트마다 스토어 루트를 따로 두는 일이라 다음 과제로 남겨뒀습니다.
-- HTTP는 평문입니다. 리버스 프록시나 서비스 메시 같은 TLS 뒤에 두세요.
 - Rust 클라이언트 crate는 아직 없습니다.
   다만 위 API는 어떤 HTTP 클라이언트로도 부를 수 있을 만큼 작습니다.
   gRPC가 아니라 JSON을 고른 이유이기도 합니다.
