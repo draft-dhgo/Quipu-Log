@@ -16,7 +16,10 @@ pub mod auth;
 pub mod config;
 pub mod serve;
 
-pub use api::{router, spawn_periodic_verify, AppState, QuerySlot, VerifyGuard};
+pub use api::{
+    router, spawn_periodic_verify, AppState, QuerySlot, VerifyGuard, DEFAULT_IDEMPOTENCY_WINDOW,
+    IDEMPOTENCY_HEADER,
+};
 pub use auth::{sha256_hex, AuthState, TokenMap};
 pub use config::ServerConfig;
 pub use serve::{bind, serve};

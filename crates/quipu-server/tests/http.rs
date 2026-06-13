@@ -241,6 +241,96 @@ async fn full_append_query_flow() {
     pipeline.shutdown();
 }
 
+/// Like [`send`] but with an `Idempotency-Key` header on the request.
+async fn send_idem(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    key: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .header("idempotency-key", key)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, body)
+}
+
+#[tokio::test]
+async fn idempotency_key_dedupes_retransmissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/types",
+        Some("admin-token"),
+        Some(user_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // first transmission is queued, the retransmission is absorbed
+    let key = "9c5e7c52-6b14-4be1-9c5d-0a4f9f1a1a01";
+    let body = append_body("alice", "/api/retried");
+    let (status, res) =
+        send_idem(&app, "POST", "/v1/logs", "writer-token", key, body.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{res}");
+    assert_eq!(res["status"], "queued");
+    let (status, res) =
+        send_idem(&app, "POST", "/v1/logs", "writer-token", key, body.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{res}");
+    assert_eq!(res["status"], "duplicate");
+
+    // a different key is a different event
+    let (status, res) =
+        send_idem(&app, "POST", "/v1/logs", "writer-token", "other-key", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{res}");
+    assert_eq!(res["status"], "queued");
+
+    let (status, _) = send(&app, "POST", "/v1/admin/flush", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // exactly two records: the retransmission never reached the store
+    let (status, hits) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hits}");
+    assert_eq!(hits.as_array().unwrap().len(), 2);
+
+    // a malformed key is rejected up front
+    let (status, _) = send_idem(
+        &app,
+        "POST",
+        "/v1/logs",
+        "writer-token",
+        &"x".repeat(200),
+        append_body("alice", "/api/x"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    pipeline.shutdown();
+}
+
 #[tokio::test]
 async fn auth_and_permission_errors() {
     let dir = tempfile::tempdir().unwrap();

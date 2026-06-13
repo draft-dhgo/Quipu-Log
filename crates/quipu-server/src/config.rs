@@ -20,6 +20,18 @@ pub struct ServerConfig {
     /// Periodic integrity verification. Omit to disable (the
     /// `POST /v1/admin/verify` endpoint works either way).
     pub verify: Option<VerifySection>,
+    /// Idempotency-key duplicate detection on `POST /v1/logs`. Omit for the
+    /// default window size.
+    pub idempotency: Option<IdempotencySection>,
+}
+
+/// Duplicate detection for client retransmissions (`Idempotency-Key`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdempotencySection {
+    /// How many recently accepted keys the server remembers (in memory;
+    /// forgotten on restart). `0` disables duplicate detection.
+    pub window: usize,
 }
 
 #[derive(Debug, Deserialize)]

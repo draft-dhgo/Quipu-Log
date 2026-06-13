@@ -68,7 +68,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let state = AppState::new(pipeline.handle(), auth_state);
+    let mut state = AppState::new(pipeline.handle(), auth_state);
+    if let Some(idem) = &cfg.idempotency {
+        state = state.idempotency_window(idem.window);
+    }
 
     // SIGHUP = re-read the config file and swap the auth section (token
     // issue/revoke without dropping connections); reload failures keep the

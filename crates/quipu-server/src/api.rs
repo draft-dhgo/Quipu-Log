@@ -10,7 +10,7 @@ use quipu_middleware::{
     Action, AuditEvent, AuditHandle, MiddlewareError, Role, TargetSpec, VerifyReport,
 };
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,6 +35,69 @@ pub struct AppState {
     /// Completed verification passes since startup (endpoint + periodic) —
     /// an observability counter, also what tests poll.
     verify_runs: Arc<AtomicU64>,
+    /// Recently seen `Idempotency-Key` values for `POST /v1/logs`. A client
+    /// that times out cannot tell "queued" from "lost", so its retransmission
+    /// of the same event must not become a second audit record — this window
+    /// is what absorbs that duplicate. In-memory by design: see
+    /// [`DedupWindow`] for the trade-off.
+    dedup: Arc<Mutex<DedupWindow>>,
+}
+
+/// Default capacity of the idempotency-key window (see [`DedupWindow`]).
+pub const DEFAULT_IDEMPOTENCY_WINDOW: usize = 65_536;
+
+/// Fixed-capacity, insertion-ordered set of recently accepted idempotency
+/// keys. Deliberately **in-memory**: persisting every key would put a
+/// durable write on the append path *before* the event is even queued, for a
+/// duplicate class that only exists across a client retransmission window
+/// (seconds to minutes). The cost of that choice is precise and documented:
+/// a server restart forgets the window, so a retransmission that straddles a
+/// restart can be recorded twice — duplicates are bounded to that case, and
+/// both copies carry the same client-set `occurred_at`, so they are
+/// detectable after the fact.
+struct DedupWindow {
+    capacity: usize,
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl DedupWindow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Record `key`. Returns `false` if it was already in the window (a
+    /// duplicate), `true` if it is new. Oldest keys are evicted at capacity.
+    fn insert(&mut self, key: &str) -> bool {
+        if self.capacity == 0 {
+            return true; // dedup disabled
+        }
+        if self.seen.contains(key) {
+            return false;
+        }
+        if self.order.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        self.seen.insert(key.to_string());
+        self.order.push_back(key.to_string());
+        true
+    }
+
+    /// Forget `key` — used when the enqueue behind it failed, so the
+    /// client's retry is not misread as a duplicate.
+    fn remove(&mut self, key: &str) {
+        if self.seen.remove(key) {
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+        }
+    }
 }
 
 /// One reserved unit of a token's concurrent-query budget.
@@ -55,7 +118,16 @@ impl AppState {
             query_slots: Arc::new(Mutex::new(HashMap::new())),
             verify_running: Arc::new(AtomicBool::new(false)),
             verify_runs: Arc::new(AtomicU64::new(0)),
+            dedup: Arc::new(Mutex::new(DedupWindow::new(DEFAULT_IDEMPOTENCY_WINDOW))),
         }
+    }
+
+    /// Resize the idempotency-key window (config `idempotency.window`).
+    /// `0` disables duplicate detection entirely. Call before the state is
+    /// cloned into the router.
+    pub fn idempotency_window(self, capacity: usize) -> Self {
+        *self.dedup.lock().unwrap() = DedupWindow::new(capacity);
+        self
     }
 
     /// Claim the single verification slot. `None` while a verification is
@@ -300,12 +372,51 @@ struct AppendRequest {
     custom: BTreeMap<String, Value>,
 }
 
+/// Header carrying the client-generated idempotency key (any opaque string,
+/// 1–128 visible-ASCII chars; a UUIDv4 is the recommended shape).
+pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
+
+/// Extract and validate the optional `Idempotency-Key` header.
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(raw) = headers.get(IDEMPOTENCY_HEADER) else {
+        return Ok(None);
+    };
+    let bad = |msg: &str| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("{IDEMPOTENCY_HEADER}: {msg}"),
+    };
+    let key = raw
+        .to_str()
+        .map_err(|_| bad("must be visible ASCII"))?
+        .trim();
+    if key.is_empty() || key.len() > 128 {
+        return Err(bad("must be 1-128 characters"));
+    }
+    if !key.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(bad("must be visible ASCII without spaces"));
+    }
+    Ok(Some(key.to_string()))
+}
+
 async fn append_log(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<AppendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let role = state.authorize(&headers, Action::Emit)?.role;
+    // duplicate detection happens *before* the enqueue: a retransmitted key
+    // is acknowledged as already-accepted (202 "duplicate") and never becomes
+    // a second audit record. The insert reserves the key; a failed enqueue
+    // releases it below so the client's next retry isn't misread.
+    let idem = idempotency_key(&headers)?;
+    if let Some(key) = &idem {
+        if !state.dedup.lock().unwrap().insert(key) {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "status": "duplicate" })),
+            ));
+        }
+    }
     let mut event = AuditEvent::new(req.actor_type, req.actor, req.method, req.url, req.content);
     if let Some(at) = req.occurred_at {
         event.occurred_at = at;
@@ -313,7 +424,12 @@ async fn append_log(
     event.targets = req.targets;
     event.custom = req.custom;
     // enqueue only — 202: durability is the pipeline's job (retries + DLQ)
-    state.handle.emit(&role, event)?;
+    if let Err(e) = state.handle.emit(&role, event) {
+        if let Some(key) = &idem {
+            state.dedup.lock().unwrap().remove(key);
+        }
+        return Err(e.into());
+    }
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "status": "queued" })),
