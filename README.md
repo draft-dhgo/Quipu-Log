@@ -268,6 +268,45 @@ a compromised server can't recover plaintext.
 Configuration, the full HTTP API, and v1 limits live in the
 [quipu-server README](crates/quipu-server/README.md).
 
+## Meta-audit: who looked at the audit log
+
+In regulated environments, reading audit data is itself an auditable event —
+HIPAA expects a record of who viewed PHI, and that includes viewing it through
+the audit trail. Opt in and quipu records every read and admin operation
+against the store — queries, registry browsing, DLQ redrives, retention runs,
+flushes, integrity verifications, token reloads — in a dedicated **access log**:
+
+```rust
+let cfg = StoreConfig::new("./audit-data")
+    .access_log(true)                              // opt-in
+    .access_retention(RetentionPolicy::days(90));  // independent window
+```
+
+Each record carries the actor (the bearer token's role in server mode), the
+operation, a parameter summary, the result count, and a timestamp. Two things
+hold by construction:
+
+- **No self-reference loop.** Recording an access is a plain append — it never
+  runs a query, so it can never spawn another access record. Reading the
+  access log *is* recorded (it is an access too), but exactly once per read:
+  growth is linear, never recursive.
+- **Search probes stay out.** The parameter summary keeps the *shape* of a
+  query (which fields, which match mode, what time range) but never the probe
+  values — otherwise searching an HMAC/RSA-protected field would leak its
+  plaintext into the access log and defeat the field protection.
+
+Access records live in their own table (`root/access/`, with its own
+tamper-evidence chain, covered by `verify_integrity`). That separation is
+what makes the **independent retention window** possible: retention drops
+whole segments per table, so access records — usually kept shorter than the
+audit data they describe — age out on their own schedule without touching
+the main log.
+
+Reading it back: embedded, `handle.query_access(&admin_role, AccessQuery::default())`
+(filter by actor, operation, time range); in server mode, `POST /v1/access/query`
+with the `administer` grant, enabled via `store.access_log: true` /
+`store.access_retention_days` in the config.
+
 ## Operational notes
 
 - **Permissions** — role-based `Emit` / `Query` / `Administer` grants,

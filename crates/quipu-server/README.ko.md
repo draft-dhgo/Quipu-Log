@@ -36,7 +36,9 @@ cargo run -p quipu-server -- config.json
     "root": "/var/lib/quipu",
     "sync_policy": { "every_n": 64 },
     "retention_days": 365,
-    "plaintext_cache": false
+    "plaintext_cache": false,
+    "access_log": true,
+    "access_retention_days": 90
   },
   "keys": {
     "hmac_key_file": "/etc/quipu/hmac.key",
@@ -63,6 +65,10 @@ cargo run -p quipu-server -- config.json
 ```
 
 - `sync_policy`는 `"always"`, `"os_managed"`, `{ "every_n": N }` 중 하나입니다.
+- `access_log`(선택, 기본 false)는 메타 감사입니다. 스토어를 향한 모든 쿼리와
+  관리 작업을 전용 접근 로그에 남기고, `POST /v1/access/query`로 읽습니다.
+  `access_retention_days`는 접근 로그만의 보존 기간으로, `retention_days`와는
+  따로 갑니다(빼면 접근 기록을 계속 보관합니다).
 - `verify`(선택)는 주기적인 [무결성 검증](#무결성-검증)입니다.
   시작할 때 한 번, 이후 `interval_secs`마다 한 번씩 돕니다. 빼면 꺼집니다.
 - 키 자료는 항상 파일 경로로 참조합니다. 설정 파일에 직접 넣을 수 없습니다.
@@ -181,6 +187,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 | `POST /v1/logs/query` | query | `LogQuery` JSON → `[LogView]` |
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (최신 버전) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (오래된 것부터) |
+| `POST /v1/access/query` | administer | `AccessQuery` JSON(`from_micros`/`to_micros`/`actor`/`operation`/`limit`, 모두 선택) → `[AccessRecord]`. 메타 감사 — 누가 스토어를 조회·관리했는지. `store.access_log: true`가 필요합니다(아니면 400). 이 조회 자체도 정확히 한 건씩 기록됩니다. |
 | `POST /v1/admin/flush` | administer | 큐에 쌓인 것 전부 fsync → 204 |
 | `POST /v1/admin/redrive` | administer | `{"redriven": n}` |
 | `POST /v1/admin/retention` | administer | `{"segments_dropped": n}` |
