@@ -1,0 +1,25 @@
+[package]
+name = "quipu-client"
+description = "Reference client for quipu-server: timeouts, exponential backoff with jitter, idempotent retransmission, and an opt-in local disk spool that rides out server outages."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+quipu-core = { path = "../quipu-core", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crc32fast = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
