@@ -431,6 +431,47 @@ HMAC 키가 한 번 새면 그 키로 쓴 다이제스트는 영구히 노출된
 그리고 re-key의 범위는 레지스트리입니다.
 로그 행의 `method`/`url`/`content`는 설계상 평문이라 돌릴 키 자체가 없습니다.
 
+## 성능
+
+`cargo bench -p quipu-middleware --bench write_path`(criterion 0.5)로 잰
+쓰기 경로 수치입니다. 이벤트마다 actor 하나, 대상 엔티티 하나, 짧은 텍스트
+페이로드가 들어가고, `flush()`는 큐에 넣은 이벤트가 writer 스레드에서 전부
+기록될 때까지 기다립니다. 즉 채널 속도가 아니라 끝까지 쓰는 데 걸리는
+수치입니다.
+
+측정 환경: Apple M4, RAM 16GB, 내장 NVMe SSD, macOS 15, rustc 1.96.0,
+release 프로필, emit 스레드 1개.
+
+| 설정 | 기록 처리량 |
+|---|---|
+| `SyncPolicy::OsManaged` (페이지 캐시까지 flush) | 약 56,000 events/s |
+| `SyncPolicy::EveryN(64)` (64건마다 fsync) | 약 4,800 events/s |
+
+`EveryN(64)` + 큐 32,768칸 설정에서 이벤트 200,000건으로 잰 호출부
+`emit()` 지연:
+
+| 백분위 | 지연 |
+|---|---|
+| p50 | 42 ns |
+| p99 | 10.7 ms |
+| p99.9 | 11.6 ms |
+
+p50은 사실상 bounded 채널에 넣는 비용 그대로입니다. 감사 대상 요청 경로가
+평소에 내는 값은 나노초 단위라는 뜻입니다. 꼬리 지연은 디스크를 직접
+기다려서가 아니라 백프레셔 때문입니다. fsync가 writer를 붙잡는 동안 큐가
+가득 차면 `emit`이 `QueueFull`을 돌려주고, 벤치마크는 50µs 쉬었다가 다시
+시도하는데 그 시간이 p99에 그대로 잡힙니다. 버스트 패턴에 맞춰 큐 크기와
+sync 정책을 고르면 되고, `OsManaged`를 쓰면 꼬리는 사라지는 대신 전원이
+나갔을 때의 내구성을 OS 페이지 캐시에 맡기게 됩니다.
+
+속도만큼 견고함도 따로 검증합니다. `fuzz/`에 세그먼트 파서와 DLQ redrive를
+겨냥한 libFuzzer 타깃이 있고,
+`crates/quipu-middleware/tests/{stress,crash}.rs`에는 emit·flush·보존
+정책·쿼리를 동시에 돌리고 끝에 해시 체인 전체를 검증하는 스트레스 테스트,
+그리고 쓰는 도중 프로세스를 SIGKILL로 반복해서 죽이는 crash 주입 테스트가
+있습니다. PR마다 짧은 퍼징 스모크가 돌고, 긴 버전은 nightly CI에서
+돕니다.
+
 ## 워크스페이스 구성
 
 | crate | 설명 |

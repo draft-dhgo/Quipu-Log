@@ -101,7 +101,7 @@ fn admin_operations_are_meta_audited() {
     let handle = pipeline.handle();
     let admin = Role::new("admin");
 
-    assert_eq!(handle.redrive_dlq(&admin).unwrap(), 0);
+    assert_eq!(handle.redrive_dlq(&admin).unwrap().replayed, 0);
     assert_eq!(handle.apply_retention(&admin).unwrap(), 0);
     assert_eq!(handle.dlq_len(&admin).unwrap(), 0);
     assert!(handle.verify_integrity(&admin).unwrap().ok);

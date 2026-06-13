@@ -1,0 +1,44 @@
+[package]
+name = "quipu-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+bincode = "1.3"
+quipu-core = { path = "../crates/quipu-core" }
+quipu-middleware = { path = "../crates/quipu-middleware" }
+
+# this crate is deliberately outside the main workspace (see root Cargo.toml
+# `exclude`): fuzzing needs nightly + libfuzzer and must not affect normal builds
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "segment_reader"
+path = "fuzz_targets/segment_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dlq_redrive"
+path = "fuzz_targets/dlq_redrive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gen_corpus"
+path = "src/bin/gen_corpus.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

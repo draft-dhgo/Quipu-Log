@@ -408,6 +408,44 @@ low-entropy values; rotation only protects writes from then on). And re-key
 covers the registries, not log rows — `method`/`url`/`content` are plaintext
 by design and have no keys to rotate.
 
+## Performance
+
+Write-path numbers from `cargo bench -p quipu-middleware --bench write_path`
+(criterion 0.5). Each event carries one actor, one target entity and a small
+text payload; `flush()` waits until everything enqueued has been written by
+the writer thread, so these are end-to-end figures, not channel speed.
+
+Measured on an Apple M4, 16 GB RAM, internal NVMe SSD, macOS 15,
+rustc 1.96.0, release profile, single emitter thread:
+
+| configuration | durable throughput |
+|---|---|
+| `SyncPolicy::OsManaged` (flush to page cache) | ~56,000 events/s |
+| `SyncPolicy::EveryN(64)` (fsync every 64 appends) | ~4,800 events/s |
+
+Caller-side `emit()` latency with `EveryN(64)` and a 32,768-slot queue,
+sampled over 200,000 events:
+
+| percentile | latency |
+|---|---|
+| p50 | 42 ns |
+| p99 | 10.7 ms |
+| p99.9 | 11.6 ms |
+
+The p50 is just a bounded-channel enqueue — the audited request path
+normally pays nanoseconds. The tail is backpressure, not disk time on the
+caller: when fsync stalls the writer long enough to fill the queue, `emit`
+returns `QueueFull` and the benchmark retries with a 50 µs backoff. Size the
+queue and pick the sync policy for your burst profile; with `OsManaged` the
+tail disappears, at the cost of trusting the OS page cache on power loss.
+
+Robustness gets the same treatment as speed: libFuzzer targets for the
+segment parser and the DLQ redrive live in `fuzz/`, and
+`crates/quipu-middleware/tests/{stress,crash}.rs` hold a multi-thread stress
+test (emit + flush + retention + query concurrently, full chain verification
+afterwards) and a SIGKILL crash-injection test. Every PR runs a short fuzz
+smoke; the long runs happen in the nightly CI workflow.
+
 ## Workspace layout
 
 | crate | what it is |

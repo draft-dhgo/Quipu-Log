@@ -30,5 +30,6 @@ pub use metrics::{LatencySnapshot, MetricsSnapshot, PipelineMetrics};
 pub use permissions::{Action, PermissionPolicy, Role};
 pub use quipu_core::{AccessQuery, AccessRecord};
 pub use pipeline::{
-    AuditHandle, AuditPipeline, DlqEntry, FallbackFn, MiddlewareError, PipelineConfig, VerifyReport,
+    AuditHandle, AuditPipeline, DlqEntry, FallbackFn, MiddlewareError, PipelineConfig,
+    RedriveReport, VerifyReport,
 };

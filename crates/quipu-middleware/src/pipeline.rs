@@ -2,7 +2,7 @@ use crate::event::AuditEvent;
 use crate::health::{disk_usage, DiskThresholds, HealthSnapshot, HealthState};
 use crate::metrics::{MetricsSnapshot, PipelineMetrics};
 use crate::permissions::{Action, PermissionPolicy, Role};
-use quipu_core::storage::{SegmentSlice, Table, TableScan};
+use quipu_core::storage::{SegmentReader, SegmentSlice, Table, TableScan};
 use quipu_core::{
     summarize_access_query, summarize_log_query, AccessQuery, AccessRecord, AuditLog, AuditStore,
     CustomColumnDef, LogQuery, LogView, QueryPage, ReadSnapshot, TargetSnapshot, TypeSchema, Uid,
@@ -57,6 +57,30 @@ pub struct DlqEntry {
     pub event: AuditEvent,
     pub error: String,
     pub failed_at: u64,
+}
+
+/// Outcome of one DLQ redrive pass (see [`AuditHandle::redrive_dlq`]).
+///
+/// Corruption policy: a DLQ entry that cannot be decoded (its frame CRC is
+/// fine but the payload is not a valid [`DlqEntry`]) is *quarantined* — its
+/// raw bytes are preserved under `<dlq dir>.quarantine/` for forensics — and
+/// the redrive continues with the remaining entries. A frame-level corruption
+/// (bad CRC / unreadable segment) makes the rest of that segment unreadable,
+/// so the whole segment file is copied into the quarantine directory and the
+/// redrive moves on to the next segment. Either way the rebuilt DLQ contains
+/// only the entries that failed replay again — corruption never poisons the
+/// redrive permanently and never crashes the worker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RedriveReport {
+    /// Entries successfully replayed into the store.
+    pub replayed: usize,
+    /// Entries that failed replay again and were re-parked in the DLQ.
+    pub requeued: usize,
+    /// Undecodable entries preserved as raw payloads in the quarantine dir.
+    pub quarantined_entries: usize,
+    /// Segments with frame-level corruption copied to the quarantine dir
+    /// (entries after the corruption point in such a segment are unreadable).
+    pub quarantined_segments: usize,
 }
 
 /// Outcome of one tamper-evidence verification pass over the whole store
@@ -140,7 +164,7 @@ enum Command {
         reply: SyncSender<Result<(), MiddlewareError>>,
     },
     Flush(SyncSender<Result<(), MiddlewareError>>),
-    RedriveDlq(SyncSender<Result<usize, MiddlewareError>>),
+    RedriveDlq(SyncSender<Result<RedriveReport, MiddlewareError>>),
     ApplyRetention(SyncSender<Result<usize, MiddlewareError>>),
     DlqLen(SyncSender<Result<usize, MiddlewareError>>),
     VerifyIntegrity(SyncSender<Result<VerifyReport, MiddlewareError>>),
@@ -416,15 +440,16 @@ impl AuditHandle {
         self.round_trip(Command::Flush)
     }
 
-    /// Replay parked DLQ events into the store. Returns how many succeeded.
-    pub fn redrive_dlq(&self, role: &Role) -> Result<usize, MiddlewareError> {
+    /// Replay parked DLQ events into the store. Corrupt entries/segments are
+    /// quarantined, not fatal — see [`RedriveReport`] for the exact policy.
+    pub fn redrive_dlq(&self, role: &Role) -> Result<RedriveReport, MiddlewareError> {
         self.check(role, Action::Administer)?;
         let n = self.round_trip(Command::RedriveDlq)?;
         self.record_access(AccessRecord::new(
             &role.0,
             "redrive_dlq",
             "{}",
-            Some(n as u64),
+            Some(n.replayed as u64),
         ));
         Ok(n)
     }
@@ -571,6 +596,54 @@ const DLQ_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 fn redrive_staging_dir(dlq_dir: &std::path::Path) -> PathBuf {
     dlq_dir.with_extension("redrive")
+}
+
+/// What a corruption-tolerant pass over the DLQ segments found.
+#[derive(Default)]
+struct DlqRead {
+    /// Entries that decoded cleanly, in append order.
+    entries: Vec<DlqEntry>,
+    /// Raw payloads whose frame was intact (CRC ok) but which did not decode
+    /// as [`DlqEntry`].
+    corrupt_payloads: Vec<Vec<u8>>,
+    /// Segments where a frame itself was unreadable (CRC mismatch / IO
+    /// error); everything after the corruption point in them is lost.
+    corrupt_segments: Vec<PathBuf>,
+}
+
+/// Read every readable DLQ entry without letting corruption abort the pass.
+/// Frame corruption ends the affected segment (frame boundaries past it are
+/// unknowable) but never the pass; a decode failure skips just that entry.
+fn read_dlq(slices: &[SegmentSlice]) -> DlqRead {
+    let mut out = DlqRead::default();
+    for slice in slices {
+        let mut reader = match SegmentReader::open_bounded(&slice.path, slice.bound) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(segment = %slice.path.display(), error = %e, "unreadable DLQ segment");
+                out.corrupt_segments.push(slice.path.clone());
+                continue;
+            }
+        };
+        loop {
+            match reader.next_record() {
+                Ok(None) => break,
+                Ok(Some((_, payload))) => match bincode::deserialize::<DlqEntry>(&payload) {
+                    Ok(entry) => out.entries.push(entry),
+                    Err(e) => {
+                        tracing::error!(segment = %slice.path.display(), error = %e, "undecodable DLQ entry");
+                        out.corrupt_payloads.push(payload);
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(segment = %slice.path.display(), error = %e, "corrupt DLQ frame; rest of segment skipped");
+                    out.corrupt_segments.push(slice.path.clone());
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Collect every `seg-*.log` table segment under `root`, skipping the DLQ
@@ -758,11 +831,11 @@ impl Worker {
             }
             Command::DlqLen(reply) => {
                 let res = (|| {
-                    let entries = self
+                    let slices = self
                         .dlq()
-                        .and_then(|dlq| dlq.scan())
+                        .and_then(|dlq| dlq.slices())
                         .map_err(MiddlewareError::Core)?;
-                    Ok(entries.filter(|r| r.is_ok()).count())
+                    Ok(read_dlq(&slices).entries.len())
                 })();
                 if let Ok(n) = &res {
                     // an exact count just happened; sync the gauge to it
@@ -927,7 +1000,8 @@ impl Worker {
         }
     }
 
-    /// Replay every DLQ entry. Entries that fail again are re-parked.
+    /// Replay every DLQ entry. Entries that fail again are re-parked; corrupt
+    /// entries/segments are quarantined (see [`RedriveReport`]).
     ///
     /// Crash safety: failures are first written to a *staging* table and made
     /// durable; only then is the old DLQ directory removed and the staging
@@ -936,15 +1010,21 @@ impl Worker {
     /// before the swap leaves the old DLQ intact (some events may later be
     /// written twice — at-least-once, the right trade-off for audit data); a
     /// crash inside the swap is finished by [`AuditPipeline::start`].
-    fn redrive(&mut self) -> Result<usize, MiddlewareError> {
-        let entries: Vec<DlqEntry> = self
+    fn redrive(&mut self) -> Result<RedriveReport, MiddlewareError> {
+        let slices = self
             .dlq()
-            .and_then(|dlq| dlq.scan())
-            .map_err(MiddlewareError::Core)?
-            .collect::<Result<Vec<_>, _>>()
+            .and_then(|dlq| dlq.slices())
             .map_err(MiddlewareError::Core)?;
-        if entries.is_empty() {
-            return Ok(0);
+        let read = read_dlq(&slices);
+        let mut report = RedriveReport::default();
+        if !read.corrupt_payloads.is_empty() || !read.corrupt_segments.is_empty() {
+            self.quarantine(&read, &mut report)
+                .map_err(|e| MiddlewareError::Core(e.into()))?;
+        }
+        let entries = read.entries;
+        if entries.is_empty() && report.quarantined_entries == 0 && report.quarantined_segments == 0
+        {
+            return Ok(report);
         }
         let staging_dir = redrive_staging_dir(&self.dlq_dir);
         if staging_dir.exists() {
@@ -952,11 +1032,9 @@ impl Worker {
         }
         let mut staging: Table<DlqEntry> =
             Table::open(&staging_dir, DLQ_SEGMENT_BYTES).map_err(MiddlewareError::Core)?;
-        let total = entries.len();
-        let mut ok = 0;
         for entry in entries {
             match self.try_write(&entry.event) {
-                Ok(_) => ok += 1,
+                Ok(_) => report.replayed += 1,
                 Err(e) => {
                     let error = e.to_string();
                     tracing::error!(error = %error, "redriven audit event failed again, re-parked");
@@ -968,6 +1046,7 @@ impl Worker {
                     staging
                         .append(&entry, entry.failed_at)
                         .map_err(MiddlewareError::Core)?;
+                    report.requeued += 1;
                     if let Some(fb) = &self.fallback {
                         fb(&entry.event, &error);
                     }
@@ -984,8 +1063,41 @@ impl Worker {
         std::fs::rename(&staging_dir, &self.dlq_dir)
             .map_err(|e| MiddlewareError::Core(e.into()))?;
         self.dlq().map_err(MiddlewareError::Core)?;
-        self.metrics.set_dlq_entries((total - ok) as u64);
-        Ok(ok)
+        // the rebuilt DLQ holds exactly the re-parked failures (quarantined
+        // material lives outside the DLQ now), so the gauge reflects that
+        self.metrics.set_dlq_entries(report.requeued as u64);
+        Ok(report)
+    }
+
+    /// Preserve corrupt DLQ material under `<dlq dir>.quarantine/` so the
+    /// rebuilt DLQ can drop it without destroying forensic evidence. Each
+    /// undecodable payload becomes its own `entry-*.bin`; a segment with
+    /// frame-level corruption is copied whole.
+    fn quarantine(&self, read: &DlqRead, report: &mut RedriveReport) -> std::io::Result<()> {
+        let dir = self.dlq_dir.with_extension("quarantine");
+        std::fs::create_dir_all(&dir)?;
+        let stamp = quipu_core::time::now_micros();
+        for (i, payload) in read.corrupt_payloads.iter().enumerate() {
+            let path = dir.join(format!("entry-{stamp}-{i}.bin"));
+            std::fs::write(&path, payload)?;
+            report.quarantined_entries += 1;
+            tracing::error!(path = %path.display(), "undecodable DLQ entry quarantined");
+        }
+        for seg in &read.corrupt_segments {
+            let name = seg
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "segment".into());
+            let path = dir.join(format!("segment-{stamp}-{name}"));
+            std::fs::copy(seg, &path)?;
+            report.quarantined_segments += 1;
+            tracing::error!(
+                segment = %seg.display(),
+                copy = %path.display(),
+                "corrupt DLQ segment quarantined — entries past the corruption point are unreadable"
+            );
+        }
+        Ok(())
     }
 
     fn housekeeping(&mut self) {

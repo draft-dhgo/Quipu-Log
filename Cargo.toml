@@ -6,6 +6,9 @@ members = [
     "crates/quipu-server",
     "examples/axum-demo",
 ]
+# fuzzing lives in its own workspace: it needs nightly + libfuzzer and must
+# not drag those requirements into `cargo build/test --workspace`
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

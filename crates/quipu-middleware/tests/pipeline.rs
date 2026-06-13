@@ -112,7 +112,9 @@ fn failed_events_park_in_dlq_then_redrive() {
         .is_empty());
 
     // redrive still fails (type still missing) -> parked again
-    assert_eq!(handle.redrive_dlq(&admin).unwrap(), 0);
+    let report = handle.redrive_dlq(&admin).unwrap();
+    assert_eq!(report.replayed, 0);
+    assert_eq!(report.requeued, 1);
     assert_eq!(handle.dlq_len(&admin).unwrap(), 1);
     pipeline.shutdown();
 
@@ -131,7 +133,7 @@ fn failed_events_park_in_dlq_then_redrive() {
     .unwrap();
     let handle = pipeline.handle();
     assert_eq!(handle.dlq_len(&admin).unwrap(), 1, "dlq survives restart");
-    assert_eq!(handle.redrive_dlq(&admin).unwrap(), 1);
+    assert_eq!(handle.redrive_dlq(&admin).unwrap().replayed, 1);
     assert_eq!(handle.dlq_len(&admin).unwrap(), 0);
     let hits = handle.query(&admin, LogQuery::default()).unwrap();
     assert_eq!(hits.len(), 1);
@@ -232,6 +234,143 @@ fn interrupted_redrive_swap_is_recovered_on_start() {
         "staging dir adopted as the DLQ"
     );
     assert!(!staging.exists());
+    pipeline.shutdown();
+}
+
+/// An undecodable DLQ entry (intact frame, garbage payload) must not poison
+/// the redrive: it is quarantined and the decodable entries still replay.
+#[test]
+fn corrupt_dlq_entry_is_quarantined_and_redrive_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipeline = AuditPipeline::start(
+        store_at(dir.path()),
+        dir.path().to_path_buf(),
+        PermissionPolicy::allow_all(),
+        PipelineConfig {
+            max_retries: 0,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let handle = pipeline.handle();
+    let admin = Role::new("admin");
+    let bad = AuditEvent::new(
+        "default_actor",
+        EntityInput::new("svc-1").text("name", "svc"),
+        "PUT",
+        "/api/broken",
+        Content::Text("x".into()),
+    )
+    .target(TargetSpec::new("ghost_type", EntityInput::new("g-1")));
+    handle.emit(&admin, bad).unwrap();
+    handle.flush().unwrap();
+    assert_eq!(handle.dlq_len(&admin).unwrap(), 1);
+    pipeline.shutdown();
+
+    // append a frame whose payload is NOT a valid DlqEntry
+    let seg = dir.path().join("dlq").join("seg-0000000000.log");
+    {
+        let mut s = quipu_core::storage::Segment::open(&seg, [0u8; 32]).unwrap();
+        s.append(b"definitely not a bincode DlqEntry", 1).unwrap();
+        s.sync().unwrap();
+    }
+
+    // fix the schema so the good entry can replay
+    let mut store = store_at(dir.path());
+    store
+        .define_type(TypeSchema::new("ghost_type", vec![FieldDef::text("name")]))
+        .unwrap();
+    let pipeline = AuditPipeline::start(
+        store,
+        dir.path().to_path_buf(),
+        PermissionPolicy::allow_all(),
+        PipelineConfig::default(),
+        None,
+    )
+    .unwrap();
+    let handle = pipeline.handle();
+    // the corrupt frame is skipped by dlq_len too
+    assert_eq!(handle.dlq_len(&admin).unwrap(), 1);
+
+    let report = handle.redrive_dlq(&admin).unwrap();
+    assert_eq!(report.replayed, 1);
+    assert_eq!(report.requeued, 0);
+    assert_eq!(report.quarantined_entries, 1);
+    assert_eq!(report.quarantined_segments, 0);
+    assert_eq!(handle.dlq_len(&admin).unwrap(), 0);
+
+    // the raw payload survives in the quarantine dir for forensics
+    let quarantine = dir.path().join("dlq.quarantine");
+    let files: Vec<_> = std::fs::read_dir(&quarantine)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        std::fs::read(&files[0]).unwrap(),
+        b"definitely not a bincode DlqEntry"
+    );
+    pipeline.shutdown();
+}
+
+/// Frame-level corruption (flipped bytes -> CRC mismatch) ends the affected
+/// segment but not the redrive: the valid prefix is still processed and the
+/// damaged segment is copied to quarantine.
+#[test]
+fn corrupt_dlq_frame_quarantines_segment_without_failing_redrive() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipeline = AuditPipeline::start(
+        store_at(dir.path()),
+        dir.path().to_path_buf(),
+        PermissionPolicy::allow_all(),
+        PipelineConfig {
+            max_retries: 0,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let handle = pipeline.handle();
+    let admin = Role::new("admin");
+    for i in 0..2 {
+        let bad = AuditEvent::new(
+            "default_actor",
+            EntityInput::new("svc-1").text("name", "svc"),
+            "PUT",
+            format!("/api/broken/{i}"),
+            Content::Text("x".into()),
+        )
+        .target(TargetSpec::new("ghost_type", EntityInput::new("g-1")));
+        handle.emit(&admin, bad).unwrap();
+    }
+    handle.flush().unwrap();
+    assert_eq!(handle.dlq_len(&admin).unwrap(), 2);
+
+    // flip the last byte on disk: the second entry's payload no longer
+    // matches its CRC (done while the pipeline runs, like real bit rot —
+    // a reopen would truncate the bad tail instead)
+    let seg = dir.path().join("dlq").join("seg-0000000000.log");
+    let mut bytes = std::fs::read(&seg).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xFF;
+    std::fs::write(&seg, &bytes).unwrap();
+
+    let report = handle.redrive_dlq(&admin).unwrap();
+    // first entry was readable (type still missing -> requeued); the rest of
+    // the segment was unreadable and the file went to quarantine
+    assert_eq!(report.replayed, 0);
+    assert_eq!(report.requeued, 1);
+    assert_eq!(report.quarantined_entries, 0);
+    assert_eq!(report.quarantined_segments, 1);
+    assert_eq!(handle.dlq_len(&admin).unwrap(), 1);
+
+    let quarantine = dir.path().join("dlq.quarantine");
+    let copies: Vec<_> = std::fs::read_dir(&quarantine)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(std::fs::read(&copies[0]).unwrap(), bytes);
     pipeline.shutdown();
 }
 
