@@ -286,9 +286,64 @@ Configuration, the full HTTP API, and v1 limits live in the
   a second process opening the same root fails fast instead of corrupting it.
 - **Integrity audit** — `store.verify_integrity()` walks every table's hash chain
   and reports the first record modified in place or segment swapped out.
+- **Key rotation** — see the next section; old data stays searchable and
+  decryptable across rotations, and a leaked RSA key can be retired for real.
 - **Format versioning** — segment files start with a magic + version byte,
   so future layout changes ship as migrations, not misreads.
 - **Observability** — every write outcome is reported via `tracing`.
+
+### Key rotation
+
+Every key in the `KeyRing` carries a **version** (≥ 1); the highest version of
+each kind is *active* and protects all new writes, and each stored value
+records the version it was written under. Older versions stay in the ring as
+read-side material: decryption picks the private key the record names, and
+searches probe HMAC digests under every held version — so rotating keys never
+silently cuts old records out of search results.
+
+**Routine rotation** (no compromise suspected) is just "add a higher version":
+
+```rust
+let keys = KeyRing::new()
+    .with_hmac_key_version(1, old_hmac)?      // retained: probes old digests
+    .with_hmac_key_version(2, new_hmac)?      // active: digests new writes
+    .with_private_pem_version(1, old_rsa)?    // retained: decrypts old values
+    .with_private_pem_version(2, new_rsa)?;   // active: encrypts new values
+```
+
+(or the equivalent `hmac_keys` / `rsa_keys` lists in the server config).
+Nothing else to do — old records keep working, new records use the new keys.
+Keep retired *public* keys around indefinitely: old checkpoints and re-key
+events verify against the version that signed them.
+
+**Forced rotation after a key compromise** adds an offline **re-key** pass, so
+the leaked RSA private key stops being able to read the data at rest:
+
+1. Take the service down (and back up the store directory).
+2. Add the new key versions to the config, keeping the old ones.
+3. Run `quipu-server rekey <config.json>` (or call `AuditStore::rekey()`).
+   Every RSA-protected registry value has its data key unwrapped with the old
+   private key and re-wrapped under the new public key, and the blind-index
+   tokens of RSA fields are re-digested under the new HMAC key.
+4. Verify the printed summary, then **destroy the old RSA private key** — it
+   can no longer decrypt anything in the store. Old *HMAC* keys must stay (see
+   below), as must old public keys.
+5. Restart the service.
+
+Re-keying rewrites registry tables, which produces new hash chains — exactly
+what tampering looks like. That is why the pass appends a **signed re-key
+event** to the (chained) meta table, recording each registry's old-head →
+new-head transition: `verify_integrity()` checks every re-key signature and
+that each registry chain still contains the head the latest event signed, so
+an audited re-key stays distinguishable from a silent rewrite.
+
+Two honest limits. HMAC digests are one-way and the plaintext is not on disk,
+so HMAC-protected fields *cannot* be re-keyed — they keep their recorded
+version, old HMAC keys must be retained for search, and a leaked HMAC key has
+permanently exposed the digests written under it (brute-force surface for
+low-entropy values; rotation only protects writes from then on). And re-key
+covers the registries, not log rows — `method`/`url`/`content` are plaintext
+by design and have no keys to rotate.
 
 ## Workspace layout
 

@@ -130,6 +130,36 @@ kill -HUP "$(pgrep -f quipu-server)"
 RSA 보호 필드도 서버에서 `contains` 검색이 되지만,
 그만큼 서버가 그 값을 읽을 수 있게 됩니다.
 
+### 키 로테이션
+
+위의 단일 파일 필드들은 **키 버전 1**로 읽힙니다.
+로테이션할 때는 버전을 명시하는 목록 형태로 바꾸면 됩니다.
+가장 높은 버전이 활성 키로 새 쓰기를 보호하고,
+낮은 버전들은 옛 레코드를 읽는 데 쓰입니다:
+
+```json
+"keys": {
+  "hmac_keys": [
+    { "version": 1, "file": "/etc/quipu/hmac-v1.key" },
+    { "version": 2, "file": "/etc/quipu/hmac-v2.key" }
+  ],
+  "rsa_keys": [
+    { "version": 1, "public_key_pem_file": "/etc/quipu/rsa-v1-pub.pem" },
+    { "version": 2, "public_key_pem_file": "/etc/quipu/rsa-v2-pub.pem" }
+  ]
+}
+```
+
+키가 유출됐다면 서버를 내린 상태에서 오프라인 re-key까지 돌립니다.
+RSA로 보호된 값을 새 키로 다시 감싸서, 옛 개인 키를 폐기할 수 있게 만드는 단계입니다:
+
+```sh
+quipu-server rekey /etc/quipu/config.json
+```
+
+전체 절차 — re-key가 해결하는 것과 못 하는 것, 그리고 변조와 어떻게 구분되는지 —
+는 [최상위 README](../../README.ko.md#키-로테이션)에 있습니다.
+
 ## TLS
 
 설정에 `tls` 섹션을 넣으면 서버가 직접 TLS를 종단합니다(rustls).

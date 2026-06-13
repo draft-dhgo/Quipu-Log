@@ -37,6 +37,10 @@ pub struct Checkpoint {
     pub record_count: u64,
     /// Chain value of the newest log record at checkpoint time.
     pub chain_head: ChainHash,
+    /// [`crate::crypto::KeyVersion`] of the RSA key that signed this
+    /// checkpoint — after a rotation, old checkpoints still verify against
+    /// the retained public key of their own version.
+    pub key_version: u32,
     /// RSA PKCS#1 v1.5 / SHA-256 signature over the fields above.
     pub signature: Vec<u8>,
 }
@@ -51,7 +55,7 @@ impl Checkpoint {
         record_count: u64,
         chain_head: ChainHash,
     ) -> Result<Self> {
-        let signature = keys.sign(&signing_bytes(
+        let (key_version, signature) = keys.sign(&signing_bytes(
             created_at,
             segment_seq,
             record_count,
@@ -62,6 +66,7 @@ impl Checkpoint {
             segment_seq,
             record_count,
             chain_head,
+            key_version,
             signature,
         })
     }
@@ -69,6 +74,7 @@ impl Checkpoint {
     /// Verify the signature with the ring's public key.
     pub fn verify(&self, keys: &KeyRing) -> Result<()> {
         keys.verify_signature(
+            self.key_version,
             &signing_bytes(
                 self.created_at,
                 self.segment_seq,
@@ -111,7 +117,15 @@ struct Wire {
     segment_seq: u64,
     record_count: u64,
     chain_head: String,
+    /// Signing-key version. Defaults to 1 for lines written before key
+    /// rotation existed (JSON is self-describing, so this is additive).
+    #[serde(default = "default_key_version")]
+    key_version: u32,
     signature: String,
+}
+
+fn default_key_version() -> u32 {
+    1
 }
 
 /// The append-only checkpoint file at the store root. Deliberately *not* a
@@ -144,6 +158,7 @@ impl CheckpointLog {
             segment_seq: cp.segment_seq,
             record_count: cp.record_count,
             chain_head: crypto::hex(&cp.chain_head),
+            key_version: cp.key_version,
             signature: crypto::b64::encode(&cp.signature),
         };
         let mut line = serde_json::to_string(&wire).map_err(|e| Error::Encode(e.to_string()))?;
@@ -197,6 +212,7 @@ fn parse_line(line: &str) -> Option<Checkpoint> {
         segment_seq: wire.segment_seq,
         record_count: wire.record_count,
         chain_head: head,
+        key_version: wire.key_version,
         signature: crypto::b64::decode(&wire.signature)?,
     })
 }

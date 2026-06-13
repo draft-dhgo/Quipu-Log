@@ -45,15 +45,48 @@ pub enum SyncPolicySpec {
 
 /// All key material is referenced by file path, never inlined in the config:
 /// configs travel through chat/tickets/repos far more often than key files.
+///
+/// Two shapes: the single-file fields are the pre-rotation form and load as
+/// **key version 1**; the `hmac_keys` / `rsa_keys` lists carry explicit
+/// versions for rotated deployments. The highest version of each kind is
+/// *active* (protects new writes); lower versions are read-side material for
+/// old records. A version may appear in only one of the two shapes.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysSection {
     /// Secret key for HMAC-protected fields (raw bytes, used as-is).
+    /// Loads as HMAC key version 1.
     pub hmac_key_file: Option<PathBuf>,
     /// RSA public key (PEM) — enough to *write* encrypted fields.
+    /// Loads as RSA key version 1.
     pub public_key_pem_file: Option<PathBuf>,
     /// RSA private key (PKCS#8 PEM). Optional by design: a write-only server
     /// should not hold it; querying clients then decrypt locally.
+    /// Loads as RSA key version 1.
+    pub private_key_pem_file: Option<PathBuf>,
+    /// Versioned HMAC keys, e.g. `[{"version": 1, "file": "..."}, ...]`.
+    #[serde(default)]
+    pub hmac_keys: Vec<VersionedKeyFile>,
+    /// Versioned RSA keypairs, e.g.
+    /// `[{"version": 2, "public_key_pem_file": "...",
+    ///    "private_key_pem_file": "..."}]` (either half may be omitted —
+    /// write-only servers list only public keys).
+    #[serde(default)]
+    pub rsa_keys: Vec<VersionedRsaKey>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionedKeyFile {
+    pub version: u32,
+    pub file: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionedRsaKey {
+    pub version: u32,
+    pub public_key_pem_file: Option<PathBuf>,
     pub private_key_pem_file: Option<PathBuf>,
 }
 
@@ -203,15 +236,43 @@ impl ServerConfig {
     }
 
     pub fn keyring(&self) -> quipu_core::Result<KeyRing> {
+        let dup = |kind: &str, version: u32| {
+            quipu_core::Error::Crypto(format!(
+                "keys: {kind} version {version} is configured twice (the single-file \
+                 fields are version 1 — use distinct versions in the list form)"
+            ))
+        };
         let mut ring = KeyRing::new();
+        let mut hmac_seen = std::collections::HashSet::new();
+        let mut rsa_seen = std::collections::HashSet::new();
         if let Some(p) = &self.keys.hmac_key_file {
-            ring = ring.with_hmac_key(std::fs::read(p)?);
+            hmac_seen.insert(1);
+            ring = ring.with_hmac_key_version(1, std::fs::read(p)?)?;
         }
         if let Some(p) = &self.keys.public_key_pem_file {
-            ring = ring.with_public_pem(&std::fs::read_to_string(p)?)?;
+            rsa_seen.insert(1);
+            ring = ring.with_public_pem_version(1, &std::fs::read_to_string(p)?)?;
         }
         if let Some(p) = &self.keys.private_key_pem_file {
-            ring = ring.with_private_pem(&std::fs::read_to_string(p)?)?;
+            rsa_seen.insert(1);
+            ring = ring.with_private_pem_version(1, &std::fs::read_to_string(p)?)?;
+        }
+        for k in &self.keys.hmac_keys {
+            if !hmac_seen.insert(k.version) {
+                return Err(dup("hmac", k.version));
+            }
+            ring = ring.with_hmac_key_version(k.version, std::fs::read(&k.file)?)?;
+        }
+        for k in &self.keys.rsa_keys {
+            if !rsa_seen.insert(k.version) {
+                return Err(dup("rsa", k.version));
+            }
+            if let Some(p) = &k.public_key_pem_file {
+                ring = ring.with_public_pem_version(k.version, &std::fs::read_to_string(p)?)?;
+            }
+            if let Some(p) = &k.private_key_pem_file {
+                ring = ring.with_private_pem_version(k.version, &std::fs::read_to_string(p)?)?;
+            }
         }
         Ok(ring)
     }

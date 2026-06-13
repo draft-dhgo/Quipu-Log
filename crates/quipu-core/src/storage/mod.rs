@@ -21,4 +21,4 @@ mod segment;
 mod table;
 
 pub use segment::{ChainHash, Segment, SegmentReader};
-pub use table::{SegmentSlice, Table, TableScan};
+pub use table::{rewrite_table, RewriteStats, SegmentSlice, Table, TableScan};

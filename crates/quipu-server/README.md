@@ -122,6 +122,37 @@ Configuring the private key (plus `plaintext_cache: true`)
 enables server-side `contains` search on RSA-protected fields,
 at the cost of the server being able to read them.
 
+### Key rotation
+
+The single-file fields above load as **key version 1**. To rotate, switch to
+the versioned lists — the highest version is active (protects new writes),
+lower ones stay for reading old records:
+
+```json
+"keys": {
+  "hmac_keys": [
+    { "version": 1, "file": "/etc/quipu/hmac-v1.key" },
+    { "version": 2, "file": "/etc/quipu/hmac-v2.key" }
+  ],
+  "rsa_keys": [
+    { "version": 1, "public_key_pem_file": "/etc/quipu/rsa-v1-pub.pem" },
+    { "version": 2, "public_key_pem_file": "/etc/quipu/rsa-v2-pub.pem" }
+  ]
+}
+```
+
+After a key compromise, follow up with the offline re-key pass (server
+stopped; it re-wraps RSA-protected values so the old private key can be
+destroyed):
+
+```sh
+quipu-server rekey /etc/quipu/config.json
+```
+
+The full procedure — what re-key can and cannot fix, and why it stays
+distinguishable from tampering — is in the
+[top-level README](../../README.md#key-rotation).
+
 ## TLS
 
 Add a `tls` section and the server terminates TLS itself (rustls):

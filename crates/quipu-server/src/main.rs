@@ -3,8 +3,73 @@ use quipu_middleware::{AuditPipeline, PermissionPolicy, PipelineConfig};
 use quipu_server::{router, AppState, ServerConfig};
 
 fn usage() -> ! {
-    eprintln!("usage: quipu-server <config.json>");
+    eprintln!("usage: quipu-server <config.json>          serve");
+    eprintln!("       quipu-server rekey <config.json>    offline re-key (see README)");
     std::process::exit(2);
+}
+
+fn load_config(config_path: &str) -> ServerConfig {
+    match ServerConfig::load(std::path::Path::new(config_path)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to load config '{config_path}': {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Offline re-key: re-wrap RSA-protected registry values (and re-digest
+/// their index tokens) under the active key versions, recording a signed
+/// re-key event. The server must not be running — the store lock enforces it.
+fn run_rekey(config_path: &str) -> ! {
+    let cfg = load_config(config_path);
+    let store_cfg = match cfg.store_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("invalid store/keys config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let root = store_cfg.root.clone();
+    let mut store = match AuditStore::open(store_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "failed to open store at '{}': {e} (is the server still running?)",
+                root.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let event = match store.rekey() {
+        Ok(ev) => ev,
+        Err(e) => {
+            eprintln!("re-key failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = store.verify_integrity() {
+        eprintln!("re-key wrote an event but post-verification failed: {e}");
+        std::process::exit(1);
+    }
+    println!(
+        "re-key complete: RSA values now under key version {}, index tokens under HMAC \
+         version {} ({})",
+        event.rsa_version,
+        event.hmac_version,
+        if event.hmac_version == 0 { "none configured" } else { "active" },
+    );
+    for t in &event.tables {
+        println!(
+            "  registry '{}': {} records, chain {}.. -> {}..",
+            t.type_name,
+            t.records,
+            &t.old_chain_head[..12.min(t.old_chain_head.len())],
+            &t.new_chain_head[..12.min(t.new_chain_head.len())],
+        );
+    }
+    println!("signed re-key event recorded (signing key version {}); integrity verified", event.signing_key_version);
+    std::process::exit(0);
 }
 
 #[tokio::main]
@@ -15,17 +80,13 @@ async fn main() {
         )
         .init();
 
-    let mut args = std::env::args().skip(1);
-    let (Some(config_path), None) = (args.next(), args.next()) else {
-        usage()
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config_path = match args.as_slice() {
+        [cmd, config] if cmd == "rekey" => run_rekey(config),
+        [config] => config.clone(),
+        _ => usage(),
     };
-    let cfg = match ServerConfig::load(std::path::Path::new(&config_path)) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to load config '{config_path}': {e}");
-            std::process::exit(1);
-        }
-    };
+    let cfg = load_config(&config_path);
 
     let store_cfg = match cfg.store_config() {
         Ok(c) => c,

@@ -225,6 +225,70 @@ fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{SEGMENT_PREFIX}{seq:010}{SEGMENT_SUFFIX}"))
 }
 
+/// What [`rewrite_table`] did: the chain head before and after, and the
+/// number of records carried over. The caller is expected to persist the
+/// head transition somewhere auditable — a rewritten chain is otherwise
+/// indistinguishable from a tampered one.
+#[derive(Debug, Clone)]
+pub struct RewriteStats {
+    pub old_chain_head: ChainHash,
+    pub new_chain_head: ChainHash,
+    pub records: u64,
+}
+
+/// Rewrite every row of the table at `dir` through `f`, producing a *fresh*
+/// hash chain (zero seed). Row order and per-row timestamps are preserved.
+///
+/// The rewrite goes to a sibling `<dir>.rewrite` directory first and is
+/// fsynced before the swap, so a crash mid-rewrite leaves the original table
+/// untouched; a crash between the two renames leaves a `<dir>.pre-rewrite`
+/// backup to recover from by hand. Offline use only — the caller must hold
+/// the store lock and have dropped every other handle to this table.
+pub fn rewrite_table<T: Serialize + DeserializeOwned>(
+    dir: &Path,
+    max_segment_bytes: u64,
+    mut f: impl FnMut(T) -> Result<T>,
+) -> Result<RewriteStats> {
+    let name = dir
+        .file_name()
+        .ok_or_else(|| crate::error::Error::Encode("table dir has no name".into()))?
+        .to_string_lossy();
+    let tmp = dir.with_file_name(format!("{name}.rewrite"));
+    let backup = dir.with_file_name(format!("{name}.pre-rewrite"));
+    for stale in [&tmp, &backup] {
+        if stale.exists() {
+            std::fs::remove_dir_all(stale)?;
+        }
+    }
+
+    let mut old: Table<T> = Table::open(dir, max_segment_bytes)?;
+    let old_chain_head = old.chain_head();
+    let slices = old.slices()?;
+    let mut fresh: Table<T> = Table::open(&tmp, max_segment_bytes)?;
+    for slice in slices {
+        let mut reader = SegmentReader::open_bounded(&slice.path, slice.bound)?;
+        while let Some((ts, payload)) = reader.next_record()? {
+            let row: T = bincode::deserialize(&payload)?;
+            fresh.append(&f(row)?, ts)?;
+        }
+    }
+    fresh.sync()?;
+    let new_chain_head = fresh.chain_head();
+    let records = fresh.record_count();
+
+    // close both tables before touching their directories
+    drop(old);
+    drop(fresh);
+    std::fs::rename(dir, &backup)?;
+    std::fs::rename(&tmp, dir)?;
+    std::fs::remove_dir_all(&backup)?;
+    Ok(RewriteStats {
+        old_chain_head,
+        new_chain_head,
+        records,
+    })
+}
+
 /// One segment file plus the byte length that belongs to a snapshot.
 #[derive(Debug, Clone)]
 pub struct SegmentSlice {

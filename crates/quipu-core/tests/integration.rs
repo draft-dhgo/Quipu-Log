@@ -232,7 +232,7 @@ fn hashed_fields_stay_searchable_rsa_fields_decrypt() {
     let snap = &hits[0].targets[0];
     assert!(matches!(
         snap.fields.get("ssn").unwrap(),
-        StoredValue::Hmac(_)
+        StoredValue::Hmac { .. }
     ));
     assert!(matches!(
         snap.fields.get("mrn").unwrap(),

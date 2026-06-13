@@ -1,13 +1,13 @@
 use crate::checkpoint::{Checkpoint, CheckpointLog};
-use crate::crypto::KeyRing;
+use crate::crypto::{self, KeyRing, KeyVersion, KEYLESS};
 use crate::error::{Error, Result};
 use crate::id::Uid;
-use crate::model::{AuditLog, Content, TargetRelation, Value};
+use crate::model::{AuditLog, Content, StoredValue, TargetRelation, Value};
 use crate::query::{LogQuery, LogView, TargetFilter, TargetSnapshot};
-use crate::registry::{EntityInput, RegistryIndex, RegistryRecord, TypeRegistry};
+use crate::registry::{EntityInput, FieldTokens, RegistryIndex, RegistryRecord, TypeRegistry};
 use crate::retention::RetentionPolicy;
-use crate::schema::{CustomColumnDef, TypeSchema};
-use crate::storage::{SegmentSlice, Table, TableScan};
+use crate::schema::{CustomColumnDef, FieldIndex, TypeSchema};
+use crate::storage::{rewrite_table, ChainHash, SegmentSlice, Table, TableScan};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -100,10 +100,78 @@ impl StoreConfig {
 
 /// Persisted meta events: schema and custom-column definitions are themselves
 /// stored in an append-only table and replayed on open.
+///
+/// bincode encodes the variant *index*, so new variants may only be appended
+/// at the end.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum MetaEvent {
     TypeDefined(TypeSchema),
     CustomColumnDefined(CustomColumnDef),
+    Rekeyed(RekeyEvent),
+}
+
+/// Domain separation for re-key event signatures — never confusable with a
+/// checkpoint signature made by the same key.
+const REKEY_SIGNING_DOMAIN: &[u8] = b"quipu-rekey-v1\0";
+
+/// The signed, persisted record of one [`AuditStore::rekey`] pass.
+///
+/// Re-keying rewrites registry tables, which necessarily produces new hash
+/// chains — exactly what tampering looks like. This event is what makes the
+/// rewrite *audited* instead: it is appended to the (chained) meta table and
+/// signs the old-head → new-head transition of every rewritten registry with
+/// the active RSA key. [`AuditStore::verify_integrity`] then checks that each
+/// registry chain still contains the head the latest re-key event signed —
+/// a registry rewritten outside this path contradicts the signature.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RekeyEvent {
+    /// UTC micros at re-key time.
+    pub occurred_at: u64,
+    /// RSA key version values were re-wrapped to (the active one).
+    pub rsa_version: KeyVersion,
+    /// HMAC key version recomputed index tokens were digested with
+    /// ([`KEYLESS`] when the ring holds no HMAC key).
+    pub hmac_version: KeyVersion,
+    pub tables: Vec<RekeyedTable>,
+    /// Version of the RSA key that signed this event.
+    pub signing_key_version: KeyVersion,
+    /// RSA PKCS#1 v1.5 / SHA-256 signature over the fields above.
+    pub signature: Vec<u8>,
+}
+
+/// One registry table rewritten by a re-key pass: the signed chain-head
+/// transition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RekeyedTable {
+    pub type_name: String,
+    pub records: u64,
+    /// Hex chain head before the rewrite (the chain this event retires).
+    pub old_chain_head: String,
+    /// Hex chain head after the rewrite (the chain this event vouches for).
+    pub new_chain_head: String,
+}
+
+fn rekey_signing_bytes(
+    occurred_at: u64,
+    rsa_version: KeyVersion,
+    hmac_version: KeyVersion,
+    tables: &[RekeyedTable],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(REKEY_SIGNING_DOMAIN.len() + 16 + tables.len() * 160);
+    out.extend_from_slice(REKEY_SIGNING_DOMAIN);
+    out.extend_from_slice(&occurred_at.to_le_bytes());
+    out.extend_from_slice(&rsa_version.to_le_bytes());
+    out.extend_from_slice(&hmac_version.to_le_bytes());
+    for t in tables {
+        out.extend_from_slice(t.type_name.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&t.records.to_le_bytes());
+        out.extend_from_slice(t.old_chain_head.as_bytes());
+        out.push(0);
+        out.extend_from_slice(t.new_chain_head.as_bytes());
+        out.push(0);
+    }
+    out
 }
 
 /// The embedded audit store. Owns every table under one root directory:
@@ -167,6 +235,9 @@ impl AuditStore {
                 MetaEvent::CustomColumnDefined(def) => {
                     custom_columns.insert(def.name.clone(), def);
                 }
+                // re-key events are audit records, not state to replay; they
+                // are read back during verify_integrity()
+                MetaEvent::Rekeyed(_) => {}
             }
         }
         let checkpoints = CheckpointLog::new(&cfg.root);
@@ -514,7 +585,155 @@ impl AuditStore {
         for reg in self.registries.values_mut() {
             reg.verify()?;
         }
-        self.verify_checkpoints()
+        self.verify_checkpoints()?;
+        self.verify_rekey_events()
+    }
+
+    // ---- key rotation / re-key ----------------------------------------------
+
+    /// Re-wrap every RSA-protected registry value under the *active* RSA key
+    /// and re-digest the blind-index tokens of RSA fields under the *active*
+    /// HMAC key — the offline tail of a key rotation, so retired private keys
+    /// can actually be destroyed.
+    ///
+    /// Requirements: the ring must hold the private key of every RSA version
+    /// still referenced by stored values (to unwrap the old data keys) *and*
+    /// the active version's private key (this pass is signed). The store
+    /// must be otherwise idle — run it from the maintenance CLI, not a
+    /// serving process.
+    ///
+    /// What it cannot do: HMAC digests are one-way and the plaintext is not
+    /// on disk, so HMAC-protected fields keep their recorded key version —
+    /// retain old HMAC keys (read-side) for search, and treat a leaked HMAC
+    /// key as having exposed the digests written under it.
+    ///
+    /// Each registry table is rewritten into a fresh hash chain; the
+    /// old-head → new-head transition of every table is recorded and signed
+    /// in a [`RekeyEvent`] on the meta table, which
+    /// [`verify_integrity`](Self::verify_integrity) checks from then on —
+    /// that is what keeps an audited re-key distinguishable from tampering.
+    pub fn rekey(&mut self) -> Result<RekeyEvent> {
+        let keys = self.cfg.keys.clone();
+        let rsa_version = keys.active_rsa_version().ok_or_else(|| {
+            Error::Crypto("re-key: no RSA key in the ring — nothing to re-wrap to".into())
+        })?;
+        if !keys.can_sign() {
+            return Err(Error::Crypto(
+                "re-key requires the active RSA private key (the re-key event is signed)".into(),
+            ));
+        }
+        let hmac_version = keys.active_hmac_version().unwrap_or(KEYLESS);
+
+        let mut names: Vec<String> = self.registries.keys().cloned().collect();
+        names.sort();
+        let mut tables = Vec::with_capacity(names.len());
+        for name in names {
+            // drop the open registry (its table holds open file handles)
+            // before rewriting its directory, then reopen on the new chain
+            let reg = self
+                .registries
+                .remove(&name)
+                .expect("name was just listed");
+            let schema = reg.schema().clone();
+            drop(reg);
+            let dir = self.cfg.root.join("registry").join(&name);
+            let stats = rewrite_table::<RegistryRecord>(&dir, self.cfg.max_segment_bytes, |rec| {
+                rekey_record(rec, &schema, &keys)
+            })?;
+            let reopened = TypeRegistry::open(
+                &dir,
+                schema,
+                self.cfg.max_segment_bytes,
+                self.cfg.plaintext_cache,
+            )?;
+            self.registries.insert(name.clone(), reopened);
+            tables.push(RekeyedTable {
+                type_name: name,
+                records: stats.records,
+                old_chain_head: crypto::hex(&stats.old_chain_head),
+                new_chain_head: crypto::hex(&stats.new_chain_head),
+            });
+        }
+
+        let occurred_at = crate::time::now_micros();
+        let (signing_key_version, signature) = keys.sign(&rekey_signing_bytes(
+            occurred_at,
+            rsa_version,
+            hmac_version,
+            &tables,
+        ))?;
+        let event = RekeyEvent {
+            occurred_at,
+            rsa_version,
+            hmac_version,
+            tables,
+            signing_key_version,
+            signature,
+        };
+        self.meta
+            .append(&MetaEvent::Rekeyed(event.clone()), occurred_at)?;
+        self.meta.sync()?;
+        Ok(event)
+    }
+
+    /// Every re-key event recorded so far, oldest first.
+    pub fn rekey_events(&mut self) -> Result<Vec<RekeyEvent>> {
+        let mut out = Vec::new();
+        for ev in self.meta.scan()? {
+            if let MetaEvent::Rekeyed(r) = ev? {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Verify every recorded re-key event's signature, and that each registry
+    /// chain still contains the head the *latest* re-key event signed for it
+    /// (later upserts extend the chain past it; a rewrite severs it). Older
+    /// events' heads were legitimately retired by the next re-key.
+    fn verify_rekey_events(&mut self) -> Result<()> {
+        let events = self.rekey_events()?;
+        let mut latest_heads: HashMap<String, ChainHash> = HashMap::new();
+        for ev in &events {
+            self.cfg
+                .keys
+                .verify_signature(
+                    ev.signing_key_version,
+                    &rekey_signing_bytes(
+                        ev.occurred_at,
+                        ev.rsa_version,
+                        ev.hmac_version,
+                        &ev.tables,
+                    ),
+                    &ev.signature,
+                )
+                .map_err(|e| Error::Crypto(format!("re-key event signature invalid: {e}")))?;
+            for t in &ev.tables {
+                let head: ChainHash = crypto::hex_decode(&t.new_chain_head)
+                    .and_then(|v| v.try_into().ok())
+                    .ok_or_else(|| Error::Corrupt {
+                        segment: format!("meta (re-key event for '{}')", t.type_name),
+                        offset: 0,
+                        reason: "malformed chain head in re-key event".into(),
+                    })?;
+                latest_heads.insert(t.type_name.clone(), head);
+            }
+        }
+        for (name, head) in latest_heads {
+            let Some(reg) = self.registries.get_mut(&name) else {
+                continue; // type defined again later under a fresh table
+            };
+            if !reg.contains_chain_value(&head)? {
+                return Err(Error::Corrupt {
+                    segment: format!("registry/{name}"),
+                    offset: 0,
+                    reason: "registry chain no longer contains the head signed by the latest \
+                             re-key event — the registry was rewritten outside an audited re-key"
+                        .into(),
+                });
+            }
+        }
+        Ok(())
     }
 
     // ---- integrity checkpoints --------------------------------------------
@@ -682,6 +901,48 @@ impl AuditStore {
     pub fn decrypt(&self, v: &crate::model::StoredValue) -> Result<Vec<u8>> {
         self.cfg.keys.decrypt(v)
     }
+}
+
+/// Re-key one registry record: re-wrap RSA values to the active RSA version
+/// and re-digest the index tokens of RSA fields under the active HMAC key
+/// (their plaintext is recoverable, unlike one-way hashed fields' — those
+/// keep their recorded version and stay matchable via multi-version probes).
+fn rekey_record(
+    mut rec: RegistryRecord,
+    schema: &TypeSchema,
+    keys: &KeyRing,
+) -> Result<RegistryRecord> {
+    let names: Vec<String> = rec
+        .fields
+        .iter()
+        .filter(|(_, v)| matches!(v, StoredValue::Rsa { .. }))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for name in names {
+        let rewrapped = keys.rewrap(&rec.fields[&name])?;
+        if let Some(def) = schema.field(&name) {
+            if def.search != FieldIndex::None {
+                let plaintext = keys.decrypt(&rewrapped)?;
+                let text = String::from_utf8_lossy(&plaintext).into_owned();
+                let mut key_version = KEYLESS;
+                let mut digests = Vec::new();
+                for t in crate::tokens::value_tokens(&text, def.search) {
+                    let (v, d) = keys.index_token_digest(&def.name, def.protection, &t)?;
+                    key_version = v;
+                    digests.push(d);
+                }
+                rec.tokens.insert(
+                    name.clone(),
+                    FieldTokens {
+                        key_version,
+                        digests,
+                    },
+                );
+            }
+        }
+        rec.fields.insert(name, rewrapped);
+    }
+    Ok(rec)
 }
 
 fn snapshot_of(rec: &crate::registry::RegistryRecord) -> TargetSnapshot {

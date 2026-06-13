@@ -27,15 +27,17 @@ pub mod time;
 mod tokens;
 
 pub use checkpoint::Checkpoint;
-pub use crypto::KeyRing;
+pub use crypto::{KeyRing, KeyVersion, KEYLESS};
 pub use error::{Error, Result};
 pub use id::Uid;
 pub use model::{AuditLog, Content, StoredValue, TargetRelation, Value, ValueKind};
 pub use query::{LogQuery, LogView, MatchMode, TargetFilter, TargetSnapshot};
-pub use registry::EntityInput;
+pub use registry::{EntityInput, FieldTokens};
 pub use retention::RetentionPolicy;
 pub use schema::{
     default_actor_type, default_target_type, CustomColumnDef, FieldDef, FieldIndex,
     FieldProtection, TypeSchema,
 };
-pub use store::{AnchorHook, AuditStore, ReadSnapshot, StoreConfig, SyncPolicy};
+pub use store::{
+    AnchorHook, AuditStore, ReadSnapshot, RekeyEvent, RekeyedTable, StoreConfig, SyncPolicy,
+};
