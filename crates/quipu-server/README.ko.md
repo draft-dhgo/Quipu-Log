@@ -222,7 +222,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 | `GET /v1/types` | query | `[TypeSchema]` |
 | `POST /v1/columns` | administer | `CustomColumnDef` JSON → 204 |
 | `POST /v1/logs` | emit | 기록 요청 → **202** `{"status":"queued"}` |
-| `POST /v1/logs/query` | query | `LogQuery` JSON → `[LogView]` |
+| `POST /v1/logs/query` | query | `LogQuery` JSON → `{"logs": [LogView], "next_cursor"?, "segments_scanned"}` |
+| `POST /v1/logs/count` | query | `LogQuery` JSON → `{"count": n}` (렌더링·복호화 없음) |
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (최신 버전) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (오래된 것부터) |
 | `POST /v1/admin/flush` | administer | 큐에 쌓인 것 전부 fsync → 204 |
@@ -284,6 +285,37 @@ curl -s -X POST localhost:7700/v1/logs/query \
 `include_past`는 기본이 `true`라서 이름이 바뀐 엔티티도 옛 이름으로 찾을 수 있습니다.
 결과는 `LogView` 행으로,
 로그와 함께 기록 당시 모습 그대로의 actor/target 스냅샷이 담겨 옵니다.
+
+응답은 한 **페이지**입니다.
+
+```json
+{
+  "logs": [ ... ],
+  "next_cursor": "AQEDAAAAAAAAACkAAAAAAAAA",
+  "segments_scanned": 2
+}
+```
+
+- `order`는 `"desc"`(기본 — 최신부터, 그래서 `limit`은 "최신 N건"이라는 뜻)
+  또는 `"asc"`입니다. 시간 범위(`from_micros`/`to_micros`)를 주면
+  범위 밖 세그먼트 파일은 아예 열지도 않습니다.
+- 매치가 더 남아 있으면 `next_cursor`가 옵니다. 나머지 조건이 **동일한**
+  쿼리에 `"cursor"`로 그대로 되돌려 보내면 다음 페이지를 받습니다.
+  파싱할 값이 아니라 불투명한 토큰입니다. 마지막 페이지에는 `next_cursor`가 없습니다.
+- 페이지를 넘기는 동안 커서는 계속 유효합니다. 최신순 목록을 보던 중에
+  새 레코드가 기록돼도 남은 페이지가 밀리거나 중복되거나 빠지지 않습니다
+  (새 레코드는 다음 번 새 쿼리에서 보입니다).
+- 디코딩되지 않는 커서나 반대 `order`로 발급된 커서는 400을 받습니다.
+
+렌더링·복호화 비용 없이 결과 건수만 알고 싶으면 같은 `LogQuery` 본문으로
+`POST /v1/logs/count`를 호출하세요 (`limit`, `cursor`, `order`는 무시됩니다).
+
+```sh
+curl -s -X POST localhost:7700/v1/logs/count \
+  -H 'Authorization: Bearer aud1tor-t0ken' -H 'Content-Type: application/json' \
+  -d '{ "method": "DELETE", "from_micros": 1780000000000000 }'
+# {"count": 1843}
+```
 
 ### 타입 정의
 

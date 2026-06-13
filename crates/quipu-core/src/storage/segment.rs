@@ -41,6 +41,10 @@ fn chain_next(prev: &ChainHash, payload: &[u8]) -> ChainHash {
 pub struct Skim {
     /// Length of the valid prefix (header + whole, CRC-clean frames).
     pub valid_len: u64,
+    /// Lowest record timestamp in the file (`u64::MAX` when empty); paired
+    /// with `max_timestamp` it bounds the segment's time range so scans can
+    /// skip segments entirely outside a queried window.
+    pub min_timestamp: u64,
     pub max_timestamp: u64,
     /// Number of valid frames; feeds the table-level record count that
     /// integrity checkpoints attest to.
@@ -54,6 +58,9 @@ pub struct Segment {
     path: PathBuf,
     writer: BufWriter<File>,
     len: u64,
+    /// Lowest record timestamp in the file (`u64::MAX` while empty); together
+    /// with `max_timestamp` it gives the time-range bound used to prune scans.
+    pub min_timestamp: u64,
     /// Highest record timestamp in the file; drives retention decisions.
     pub max_timestamp: u64,
     records: u64,
@@ -84,6 +91,7 @@ impl Segment {
                     path: path.to_path_buf(),
                     writer,
                     len: s.valid_len,
+                    min_timestamp: s.min_timestamp,
                     max_timestamp: s.max_timestamp,
                     records: s.records,
                     last_chain: s.last_chain,
@@ -100,6 +108,7 @@ impl Segment {
                     path: path.to_path_buf(),
                     writer,
                     len: SEGMENT_HEADER as u64,
+                    min_timestamp: u64::MAX,
                     max_timestamp: 0,
                     records: 0,
                     last_chain: seed,
@@ -149,6 +158,7 @@ impl Segment {
         self.writer.write_all(&chain)?;
         self.writer.write_all(payload)?;
         self.len += (FRAME_HEADER + payload.len()) as u64;
+        self.min_timestamp = self.min_timestamp.min(timestamp);
         self.max_timestamp = self.max_timestamp.max(timestamp);
         self.records += 1;
         self.last_chain = chain;
@@ -211,6 +221,7 @@ pub fn skim(path: &Path) -> Result<Option<Skim>> {
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let (_, seed) = read_header(&mut reader, path)?;
     let mut valid = SEGMENT_HEADER as u64;
+    let mut min_ts = u64::MAX;
     let mut max_ts = 0u64;
     let mut records = 0u64;
     let mut last_chain = seed;
@@ -234,12 +245,14 @@ pub fn skim(path: &Path) -> Result<Option<Skim>> {
             break;
         }
         valid += (FRAME_HEADER + len as usize) as u64;
+        min_ts = min_ts.min(ts);
         max_ts = max_ts.max(ts);
         records += 1;
         last_chain = chain;
     }
     Ok(Some(Skim {
         valid_len: valid,
+        min_timestamp: min_ts,
         max_timestamp: max_ts,
         records,
         last_chain,

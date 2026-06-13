@@ -4,8 +4,8 @@ use crate::metrics::{MetricsSnapshot, PipelineMetrics};
 use crate::permissions::{Action, PermissionPolicy, Role};
 use quipu_core::storage::{SegmentSlice, Table, TableScan};
 use quipu_core::{
-    AuditLog, AuditStore, CustomColumnDef, LogQuery, LogView, ReadSnapshot, TargetSnapshot,
-    TypeSchema, Uid,
+    AuditLog, AuditStore, CustomColumnDef, LogQuery, LogView, QueryPage, ReadSnapshot,
+    TargetSnapshot, TypeSchema, Uid,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -246,6 +246,22 @@ impl AuditHandle {
     pub fn query(&self, role: &Role, q: LogQuery) -> Result<Vec<LogView>, MiddlewareError> {
         self.snapshot(role)?
             .query(&q)
+            .map_err(MiddlewareError::Core)
+    }
+
+    /// Like [`query`](Self::query), but returns one page plus the
+    /// continuation cursor (see [`quipu_core::QueryPage`]).
+    pub fn query_page(&self, role: &Role, q: LogQuery) -> Result<QueryPage, MiddlewareError> {
+        self.snapshot(role)?
+            .query_page(&q)
+            .map_err(MiddlewareError::Core)
+    }
+
+    /// Count a query's matches without rendering them (permission-gated, same
+    /// threading model as [`query`](Self::query)).
+    pub fn count(&self, role: &Role, q: LogQuery) -> Result<u64, MiddlewareError> {
+        self.snapshot(role)?
+            .count(&q)
             .map_err(MiddlewareError::Core)
     }
 
@@ -494,9 +510,15 @@ fn count_log_records(root: &Path) -> usize {
     segments.sort();
     let slices = segments
         .into_iter()
-        .map(|path| SegmentSlice {
+        .enumerate()
+        .map(|(i, path)| SegmentSlice {
             path,
             bound: u64::MAX,
+            seq: i as u64,
+            // unknown bounds: a full-width range disables time pruning, which
+            // is exactly right for a "count everything readable" pass
+            min_ts: 0,
+            max_ts: u64::MAX,
         })
         .collect();
     TableScan::<AuditLog>::over(slices)

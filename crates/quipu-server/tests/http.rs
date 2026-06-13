@@ -174,11 +174,13 @@ async fn full_append_query_flow() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let hits = body.as_array().unwrap();
+    let hits = body["logs"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["url"], "/api/things");
     assert_eq!(hits[0]["actor"]["entity_id"], "alice");
     assert_eq!(hits[0]["targets"][0]["entity_id"], "bob");
+    // single page: no continuation cursor on the wire
+    assert!(body.get("next_cursor").is_none(), "{body}");
 
     // filtered by target attribute
     let q = json!({ "targets": [{
@@ -193,7 +195,7 @@ async fn full_append_query_flow() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body["logs"].as_array().unwrap().len(), 1);
 
     // a probe that matches nothing
     let q = json!({ "targets": [{
@@ -207,7 +209,7 @@ async fn full_append_query_flow() {
         Some(q),
     )
     .await;
-    assert_eq!(body.as_array().unwrap().len(), 0);
+    assert_eq!(body["logs"].as_array().unwrap().len(), 0);
 
     // registry browsing
     let (status, body) = send(&app, "GET", "/v1/entities/user", Some("reader-token"), None).await;
@@ -570,6 +572,92 @@ async fn auth_reload_swaps_tokens_and_survives_bad_config() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn query_pagination_and_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/types",
+        Some("admin-token"),
+        Some(user_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    for i in 0..10 {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/logs",
+            Some("writer-token"),
+            Some(append_body("alice", &format!("/api/things/{i}"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+    let (status, _) = send(&app, "POST", "/v1/admin/flush", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // count without rendering
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/count",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 10);
+
+    // newest-first pages of 4: 4 + 4 + 2, chained by next_cursor
+    let mut urls = Vec::new();
+    let mut q = json!({ "limit": 4 });
+    loop {
+        let (status, body) = send(&app, "POST", "/v1/logs/query", Some("reader-token"), Some(q)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let page = body["logs"].as_array().unwrap();
+        assert!(page.len() <= 4);
+        urls.extend(
+            page.iter()
+                .map(|v| v["url"].as_str().unwrap().to_string()),
+        );
+        match body.get("next_cursor") {
+            Some(c) => q = json!({ "limit": 4, "cursor": c }),
+            None => break,
+        }
+    }
+    let want: Vec<String> = (0..10).rev().map(|i| format!("/api/things/{i}")).collect();
+    assert_eq!(urls, want);
+
+    // a garbage cursor is the client's fault
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("reader-token"),
+        Some(json!({ "cursor": "definitely-not-a-cursor" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // count requires the query grant
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs/count",
+        Some("writer-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     pipeline.shutdown();
 }

@@ -18,6 +18,9 @@ pub enum Error {
     NotFound(String),
     /// Another process already holds the store root open.
     Locked(String),
+    /// A pagination cursor failed to decode, or was issued under different
+    /// query semantics (e.g. the opposite sort order). Client error.
+    InvalidCursor(String),
 }
 
 impl fmt::Display for Error {
@@ -42,6 +45,7 @@ impl fmt::Display for Error {
                 f,
                 "store root '{root}' is locked by another process (the store is single-process)"
             ),
+            Error::InvalidCursor(m) => write!(f, "invalid cursor: {m}"),
         }
     }
 }
