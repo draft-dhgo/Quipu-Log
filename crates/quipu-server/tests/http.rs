@@ -25,10 +25,13 @@ fn test_state(
     max_concurrent_queries: Option<u32>,
 ) -> (AppState, AuditPipeline) {
     let keys = KeyRing::new().with_hmac_key(b"test-hmac-key");
+    // access_log on: every server test then doubles as proof that meta-audit
+    // does not disturb the normal API surface
     let store = AuditStore::open(
         StoreConfig::new(root)
             .keys(keys)
-            .sync_policy(SyncPolicy::Always),
+            .sync_policy(SyncPolicy::Always)
+            .access_log(true),
     )
     .unwrap();
     let policy = PermissionPolicy::deny_by_default()
@@ -237,6 +240,121 @@ async fn full_append_query_flow() {
     let (status, body) = send(&app, "GET", "/v1/admin/dlq", Some("admin-token"), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["parked"], 0);
+
+    pipeline.shutdown();
+}
+
+/// Meta-audit through the HTTP surface: queries and admin calls leave access
+/// records with the token's role as actor; reading them needs `administer`;
+/// reading them grows the log by exactly one record per read; search probe
+/// values never appear in the records.
+#[tokio::test]
+async fn access_log_records_queries_and_admin_ops() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/types",
+        Some("admin-token"),
+        Some(user_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs",
+        Some("writer-token"),
+        Some(append_body("alice", "/api/things")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = send(&app, "POST", "/v1/admin/flush", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // a reader runs a query with a probe value against a target field
+    let q = json!({ "targets": [{
+        "entity_type": "user", "field": "name", "value": { "Text": "SECRET-PROBE" }
+    }]});
+    let (status, _) = send(&app, "POST", "/v1/logs/query", Some("reader-token"), Some(q)).await;
+    assert_eq!(status, StatusCode::OK);
+    // ... and an admin runs a redrive
+    let (status, _) = send(&app, "POST", "/v1/admin/redrive", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // reading the access log needs administer
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/access/query",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/access/query",
+        Some("admin-token"),
+        Some(json!({ "operation": "query_logs" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let recs = body.as_array().unwrap();
+    assert_eq!(recs.len(), 1, "{body}");
+    assert_eq!(recs[0]["actor"], "reader");
+    assert_eq!(recs[0]["operation"], "query_logs");
+    assert_eq!(recs[0]["result_count"], 0);
+    let params = recs[0]["params"].as_str().unwrap();
+    assert!(!params.contains("SECRET-PROBE"), "probe leaked: {params}");
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/access/query",
+        Some("admin-token"),
+        Some(json!({ "operation": "redrive_dlq" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let recs = body.as_array().unwrap();
+    assert_eq!(recs.len(), 1, "{body}");
+    assert_eq!(recs[0]["actor"], "admin");
+
+    // flush (recorded at the HTTP layer) is in there too
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/v1/access/query",
+        Some("admin-token"),
+        Some(json!({ "operation": "flush" })),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), 1);
+
+    // each access-log read records itself exactly once — no snowballing
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/v1/access/query",
+        Some("admin-token"),
+        Some(json!({ "operation": "query_access" })),
+    )
+    .await;
+    let first = body.as_array().unwrap().len();
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/v1/access/query",
+        Some("admin-token"),
+        Some(json!({ "operation": "query_access" })),
+    )
+    .await;
+    assert_eq!(body.as_array().unwrap().len(), first + 1);
 
     pipeline.shutdown();
 }

@@ -33,6 +33,14 @@ pub struct StoreSection {
     /// plaintexts in server memory to allow Contains search on them.
     #[serde(default)]
     pub plaintext_cache: bool,
+    /// Opt-in meta-audit: record every query and admin operation against the
+    /// store in a dedicated access log (`POST /v1/access/query` reads it).
+    #[serde(default)]
+    pub access_log: bool,
+    /// Retention for access records, independent of `retention_days` (access
+    /// trails are often kept shorter than the audit data itself). Omit to
+    /// keep them forever.
+    pub access_retention_days: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -232,6 +240,10 @@ impl ServerConfig {
         }
         if let Some(days) = self.store.retention_days {
             cfg = cfg.retention(RetentionPolicy::days(days));
+        }
+        cfg = cfg.access_log(self.store.access_log);
+        if let Some(days) = self.store.access_retention_days {
+            cfg = cfg.access_retention(RetentionPolicy::days(days));
         }
         Ok(cfg)
     }
