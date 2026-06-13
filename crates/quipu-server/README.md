@@ -2,12 +2,7 @@
 
 English | [한국어](README.ko.md)
 
-Standalone audit-log daemon.
-It wraps the embedded `quipu-core` store in `quipu-middleware`'s async pipeline
-and exposes it over an HTTP/JSON API,
-so multiple services — in any language — can record and search audit logs centrally
-(the Elasticsearch-style deployment shape).
-The embedded mode keeps working; this is a second way to run the same engine, not a replacement.
+Standalone audit-log daemon. It wraps the embedded `quipu-core` store in `quipu-middleware`'s async pipeline and exposes it over an HTTP/JSON API, so multiple services — in any language — can record and search audit logs in one place (the Elasticsearch-style deployment shape). Embedded mode keeps working; this is a second way to run the same engine, not a replacement.
 
 ```
 service A ──┐                       ┌── root/logs
@@ -15,10 +10,7 @@ service B ──┼── HTTP ── quipu-server┼── root/registry/<type>
 auditor  ───┘   (bearer tokens)     └── root/dlq, ...
 ```
 
-The store stays single-process (`root/LOCK`); the daemon is that process.
-Appends go through the pipeline's bounded queue + writer thread (retries, disk-backed DLQ),
-queries run on point-in-time snapshots in the blocking pool,
-so a slow scan never stalls ingestion.
+The store stays single-process (`root/LOCK`); the daemon is that process. Appends go through the pipeline's bounded queue and writer thread (retries, disk-backed DLQ). Queries run on point-in-time snapshots in the blocking pool, so a slow scan never stalls ingestion.
 
 ## Running
 
@@ -70,81 +62,46 @@ cargo run -p quipu-server -- config.json
 ```
 
 - `sync_policy`: `"always"`, `"os_managed"`, or `{ "every_n": N }`.
-- `retention_days` / `retention_max_bytes` (both optional): age window and
-  byte budget for the logs + relations tables. They combine as **OR** —
-  the oldest sealed segments are dropped as soon as either limit is exceeded.
-- `access_log` (optional, default false): meta-audit — record every query and
-  admin operation against the store in a dedicated access log, readable via
-  `POST /v1/access/query`. `access_retention_days` sets its retention window
-  independently of `retention_days` (omit to keep access records forever).
-- `verify` (optional): periodic [integrity verification](#integrity-verification) —
-  one pass at startup, then one per `interval_secs`. Omit to disable.
-- `health` (optional): disk-space warning thresholds (either bound trips;
-  the values shown are the defaults) and the
-  [disk-full emit behaviour](#disk-full-behaviour).
+- `retention_days` / `retention_max_bytes` (both optional): age window and byte budget for the logs + relations tables. They combine as **OR** — the oldest sealed segments are dropped as soon as either limit is exceeded.
+- `access_log` (optional, default false): meta-audit. Records every query and admin operation against the store in a dedicated access log, readable via `POST /v1/access/query`. `access_retention_days` sets its retention window independently of `retention_days` (omit to keep access records forever).
+- `verify` (optional): periodic [integrity verification](#integrity-verification) — one pass at startup, then one per `interval_secs`. Omit to disable.
+- `health` (optional): disk-space warning thresholds (either bound trips; the values shown are the defaults) and the [disk-full emit behaviour](#disk-full-behaviour).
 - Key material is always referenced by file path, never inlined.
-- Auth is deny-by-default: a role with no grants can do nothing.
-  Run one token per calling service so tokens can be revoked individually.
+- Auth is deny-by-default: a role with no grants can do nothing. Run one token per calling service so tokens can be revoked individually.
 
 ### Token management
 
-Store tokens **hashed**: a `sha256:<hex>` key holds the SHA-256 of the
-token, so the config file itself is not a credential. Generate the hex with:
+Store tokens **hashed**. A `sha256:<hex>` key holds the SHA-256 of the token, so the config file itself isn't a credential. Generate the hex with:
 
 ```sh
 echo -n "$TOKEN" | shasum -a 256
 ```
 
-Plaintext keys keep working (the server hashes them at load time and never
-holds the raw token in memory afterwards), but each load logs a warning —
-treat them as a migration path, not a destination.
+Plaintext keys keep working — the server hashes them at load time and never holds the raw token in memory afterward — but each load logs a warning. Treat them as a migration path, not a destination.
 
-A token's value is either a bare role name or
-`{"role": ..., "expires": <unix epoch seconds>}`
-(`date -d '+90 days' +%s` on Linux, `date -v+90d +%s` on macOS).
-At or past `expires` the token is rejected exactly like an unknown one:
-a plain 401, no hint that it ever existed.
+A token's value is either a bare role name or `{"role": ..., "expires": <unix epoch seconds>}` (`date -d '+90 days' +%s` on Linux, `date -v+90d +%s` on macOS). At or past `expires`, the token is rejected exactly like an unknown one: a plain 401, no hint that it ever existed.
 
-**Hot reload.** Send `SIGHUP` to re-read the config file and swap the
-`auth` section — tokens, grants, and `max_concurrent_queries` — without a
-restart or dropped connections:
+**Hot reload.** Send `SIGHUP` to re-read the config and swap the `auth` section — tokens, grants, and `max_concurrent_queries` — with no restart and no dropped connections:
 
 ```sh
 kill -HUP "$(pgrep -f quipu-server)"
 ```
 
-Each reload logs how many tokens were added and removed, so the server log
-doubles as the issue/revoke audit trail (token material itself is never
-logged). A reload that fails — unreadable file, parse error, malformed
-`sha256:` key — keeps the previous auth config in force and logs an error.
-The other sections (`listen`, `store`, `keys`) still require a restart.
+Each reload logs how many tokens were added and removed, so the server log doubles as the issue/revoke audit trail (token material itself is never logged). A reload that fails — unreadable file, parse error, malformed `sha256:` key — keeps the previous auth config in force and logs an error. The other sections (`listen`, `store`, `keys`) still require a restart.
 
-**Per-token query cap.** Queries are full scans, so one token must not be
-able to monopolise the CPU: `auth.max_concurrent_queries` caps how many
-queries each token may have running at once (omit it for no cap). A token
-at its cap gets **429** on further queries — retry once the running ones
-finish. Appends are unaffected.
+**Per-token query cap.** Queries are full scans, so one token must not be able to monopolize the CPU. `auth.max_concurrent_queries` caps how many queries each token may run at once (omit it for no cap). A token at its cap gets **429** on further queries — retry once the running ones finish. Appends are unaffected.
 
 ### Key boundary
 
-The server only needs the **HMAC key** (write + equality-search protected fields)
-and the **RSA public key** (write encrypted fields).
+The server only needs the **HMAC key** (to write and equality-search protected fields) and the **RSA public key** (to write encrypted fields).
 
-Leave `private_key_pem_file` unset to run the server write-only:
-queries still work, but RSA-protected values come back as ciphertext
-(`{"Rsa": {wrapped_key, nonce, ciphertext}}`)
-for the querying client to decrypt locally with `KeyRing::decrypt`.
-That keeps plaintext recovery out of the server's blast radius.
+Leave `private_key_pem_file` unset to run write-only. Queries still work, but RSA-protected values come back as ciphertext (`{"Rsa": {wrapped_key, nonce, ciphertext}}`) for the querying client to decrypt locally with `KeyRing::decrypt`. Plaintext recovery stays out of the server's blast radius.
 
-Configuring the private key (plus `plaintext_cache: true`)
-enables server-side `contains` search on RSA-protected fields,
-at the cost of the server being able to read them.
+Configuring the private key (plus `plaintext_cache: true`) enables server-side `contains` search on RSA-protected fields — at the cost of the server being able to read them.
 
 ### Key rotation
 
-The single-file fields above load as **key version 1**. To rotate, switch to
-the versioned lists — the highest version is active (protects new writes),
-lower ones stay for reading old records:
+The single-file fields above load as **key version 1**. To rotate, switch to the versioned lists. The highest version is active (protects new writes); lower ones stay for reading old records:
 
 ```json
 "keys": {
@@ -159,17 +116,21 @@ lower ones stay for reading old records:
 }
 ```
 
-After a key compromise, follow up with the offline re-key pass (server
-stopped; it re-wraps RSA-protected values so the old private key can be
-destroyed):
+Routine rotation (no compromise) ends there: old records keep working, new writes use the highest version. After a key **compromise**, run the offline re-key pass so the leaked RSA private key can no longer read the data at rest:
 
-```sh
-quipu-server rekey /etc/quipu/config.json
-```
+1. Stop the service and back up the store directory.
+2. Add the new key versions to the config, keeping the old ones.
+3. Run the re-key. It unwraps every RSA-protected value with the old private key, re-wraps it under the new public key, and re-digests RSA fields' blind-index tokens under the new HMAC key:
 
-The full procedure — what re-key can and cannot fix, and why it stays
-distinguishable from tampering — is in the
-[top-level README](../../README.md#key-rotation).
+   ```sh
+   quipu-server rekey /etc/quipu/config.json   # or AuditStore::rekey() when embedded
+   ```
+4. Check the printed summary, then **destroy the old RSA private key** — it can no longer decrypt anything in the store. Keep old HMAC keys and old public keys.
+5. Restart.
+
+Re-key rewrites registry tables, which produces new hash chains — exactly what tampering looks like. So the pass appends a **signed re-key event** to the chained meta table, recording each registry's old-head → new-head transition. `verify_integrity()` checks every re-key signature and that each chain still contains the head the latest event signed, so an audited re-key stays distinguishable from a silent rewrite.
+
+Two limits. HMAC fields are one-way with no plaintext on disk, so they **can't** be re-keyed: keep their old HMAC keys for search, and know that a leaked HMAC key has permanently exposed the digests written under it. And re-key covers the registries, not log rows — `method`/`url`/`content` are plaintext by design and have no keys to rotate.
 
 ## TLS
 
@@ -182,18 +143,11 @@ Add a `tls` section and the server terminates TLS itself (rustls):
 }
 ```
 
-As with `keys`, the certificate and private key are referenced by file path,
-never inlined in the config.
+As with `keys`, the certificate and private key are referenced by file path, never inlined.
 
-Why direct termination is built in
-instead of being documented away to a reverse proxy:
-every request carries a bearer token and audit payloads (possibly PII),
-so the transport leg sits inside this server's threat model.
-Delegating it to a proxy pushes the trust boundary outside the project,
-and a standalone deployment could no longer keep its security promise on its own.
+Why TLS termination is built in rather than left to a reverse proxy: every request carries a bearer token and audit payloads, possibly PII. The transport leg sits inside this server's threat model. Hand it to a proxy and the trust boundary moves outside the project — a standalone deployment could no longer keep its security promise on its own.
 
-Running behind a TLS-terminating proxy or a service mesh still works:
-omit the `tls` section and the server speaks plain HTTP as before.
+Running behind a TLS-terminating proxy or a service mesh still works: omit the `tls` section and the server speaks plain HTTP as before.
 
 For local testing, generate a self-signed certificate:
 
@@ -205,17 +159,9 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 
 ## HTTP API
 
-All endpoints except `/v1/healthz` require `Authorization: Bearer <token>`.
-Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
-403 (role lacks the action), 400 (schema/crypto misuse), 404,
-409 (a verification is already running — retry later),
-429 (token at its concurrent-query cap — retry when a query finishes),
-503 (append queue full — back off and retry),
-507 (disk full with `reject_emit_when_disk_full` on — back off longer), or 500.
+All endpoints except `/v1/healthz` require `Authorization: Bearer <token>`. Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token), 403 (role lacks the action), 400 (schema/crypto misuse), 404, 409 (a verification is already running — retry later), 429 (token at its concurrent-query cap — retry when a query finishes), 503 (append queue full — back off and retry), 507 (disk full with `reject_emit_when_disk_full` on — back off longer), or 500.
 
-The full machine-readable contract is served at **`GET /v1/openapi.json`**
-(OpenAPI 3.1, unauthenticated — it is an interface description, not data). Point
-a code generator or Swagger UI at it; the table below is the human summary.
+The full machine-readable contract is served at **`GET /v1/openapi.json`** (OpenAPI 3.1, unauthenticated — it's an interface description, not data). Point a code generator or Swagger UI at it; the table below is the human summary.
 
 | method & path | action | body / response |
 |---|---|---|
@@ -238,10 +184,7 @@ a code generator or Swagger UI at it; the table below is the human summary.
 | `GET /v1/admin/dlq` | administer | `{"parked": n}` |
 | `POST /v1/admin/verify` | administer | verify report (below); **409** while another verification runs |
 
-A 202 means *queued*, not durable —
-durability is the pipeline's job (retries, then the DLQ; nothing is silently dropped).
-An event that fails validation asynchronously (e.g. undefined actor type) parks in the DLQ;
-watch `GET /v1/admin/dlq`.
+A 202 means *queued*, not durable — durability is the pipeline's job (retries, then the DLQ; nothing is silently dropped). An event that fails validation asynchronously (e.g. an undefined actor type) parks in the DLQ; watch `GET /v1/admin/dlq`.
 
 ### Appending
 
@@ -261,12 +204,8 @@ curl -s -X POST localhost:7700/v1/logs \
 }'
 ```
 
-- `occurred_at` (UTC micros) is optional and defaults to server "now";
-  set it if you queue/retry on the client
-  so the log records when the action actually happened.
-- Values are tagged: `{"Text": "..."}`, `{"Number": 1.5}`, or `{"Json": "<json as a string>"}`
-  (string-wrapped because the disk format is not self-describing).
-  `content` takes `Text`/`Json` the same way.
+- `occurred_at` (UTC micros) is optional and defaults to server "now". Set it if you queue or retry on the client, so the log records when the action actually happened.
+- Values are tagged: `{"Text": "..."}`, `{"Number": 1.5}`, or `{"Json": "<json as a string>"}` (string-wrapped because the disk format isn't self-describing). `content` takes `Text`/`Json` the same way.
 
 ### Querying
 
@@ -283,10 +222,7 @@ curl -s -X POST localhost:7700/v1/logs/query \
 }'
 ```
 
-All set conditions are AND-ed; everything is optional (`{}` returns everything up to `limit`).
-`mode` is `"exact"` (default), `"exact_ci"`, `"prefix"`, or `"contains"`;
-`include_past` defaults to `true` (a renamed entity is still found by its old name).
-Hits are `LogView` rows: the log plus actor/target snapshots exactly as recorded.
+All set conditions are AND-ed; everything is optional (`{}` returns everything up to `limit`). `mode` is `"exact"` (default), `"exact_ci"`, `"prefix"`, or `"contains"`. `include_past` defaults to `true` (a renamed entity is still found by its old name). Hits are `LogView` rows: the log plus actor/target snapshots exactly as recorded.
 
 The response is one **page**:
 
@@ -298,21 +234,12 @@ The response is one **page**:
 }
 ```
 
-- `order` is `"desc"` (default — newest first, so `limit` means "the latest N")
-  or `"asc"`. With a time range (`from_micros`/`to_micros`), segment files
-  entirely outside the window are never even opened.
-- `next_cursor` is present when more matches remain. Send it back verbatim as
-  `"cursor"` with an otherwise **identical** query to get the next page; it is
-  an opaque token, not something to parse. The last page has no `next_cursor`.
-- A cursor stays valid while you paginate: records appended after a
-  newest-first listing started do not shift, duplicate, or punch holes in the
-  remaining pages (they appear in the *next* fresh query).
-- A cursor that does not decode, or was issued under the opposite `order`,
-  gets a 400.
+- `order` is `"desc"` (default — newest first, so `limit` means "the latest N") or `"asc"`. With a time range (`from_micros`/`to_micros`), segment files entirely outside the window are never opened.
+- `next_cursor` is present when more matches remain. Send it back verbatim as `"cursor"` with an otherwise **identical** query to get the next page. It's an opaque token, not something to parse. The last page has no `next_cursor`.
+- A cursor stays valid while you paginate: records appended after a newest-first listing started don't shift, duplicate, or punch holes in the remaining pages (they appear in the *next* fresh query).
+- A cursor that doesn't decode, or was issued under the opposite `order`, gets a 400.
 
-To size a result set without paying for rendering or decryption, use
-`POST /v1/logs/count` with the same `LogQuery` body (`limit`, `cursor` and
-`order` are ignored):
+To size a result set without paying for rendering or decryption, use `POST /v1/logs/count` with the same `LogQuery` body (`limit`, `cursor`, and `order` are ignored):
 
 ```sh
 curl -s -X POST localhost:7700/v1/logs/count \
@@ -323,9 +250,7 @@ curl -s -X POST localhost:7700/v1/logs/count \
 
 ### Exporting (auditor handoff, SIEM ingest)
 
-`POST /v1/logs/export` takes the **same `LogQuery` body** as `/v1/logs/query`
-but answers with `application/x-ndjson` — one `LogView` JSON object per line —
-the format auditors and log pipelines expect for bulk handoff:
+`POST /v1/logs/export` takes the **same `LogQuery` body** as `/v1/logs/query` but answers with `application/x-ndjson` — one `LogView` JSON object per line — the format auditors and log pipelines expect for bulk handoff:
 
 ```sh
 curl -s -X POST localhost:7700/v1/logs/export \
@@ -333,12 +258,7 @@ curl -s -X POST localhost:7700/v1/logs/export \
   -d '{ "from_micros": 1780000000000000 }' > audit-export.ndjson
 ```
 
-Same permission (`query`) and per-token concurrency cap as a query; the only
-difference is the response framing. Field protection obeys the same key
-boundary: a server without the RSA private key exports protected fields as
-ciphertext for the key-holder to decrypt downstream. Scope the dump with
-`from_micros`/`to_micros` — it is a full scan, so an unbounded export of a large
-store is the one query most worth bounding.
+Same permission (`query`) and per-token concurrency cap as a query; only the response framing differs. Field protection obeys the same key boundary: a server without the RSA private key exports protected fields as ciphertext for the key-holder to decrypt downstream. Scope the dump with `from_micros`/`to_micros` — it's a full scan, so an unbounded export of a large store is the one query most worth bounding.
 
 ### Defining a type
 
@@ -355,14 +275,11 @@ curl -s -X POST localhost:7700/v1/types \
 }'
 ```
 
-Same rules as embedded `define_type`: redefinition is additive only.
+Same rule as embedded `define_type`: redefinition is additive only.
 
 ## Integrity verification
 
-Every table is a hash chain (`sha256(previous chain value || payload)`,
-seeded across segment boundaries), so in-place edits and removed or
-replaced segments are detectable after the fact. The embedded API has
-`AuditStore::verify_integrity()`; the server exposes the same check two ways:
+Every table is a hash chain (`sha256(previous chain value || payload)`, seeded across segment boundaries), so in-place edits and removed or replaced segments are detectable after the fact. The embedded API has `AuditStore::verify_integrity()`; the server exposes the same check two ways.
 
 **On demand** — `POST /v1/admin/verify` (administer):
 
@@ -380,10 +297,7 @@ curl -s -X POST localhost:7700/v1/admin/verify \
 }
 ```
 
-A found chain break is a *successful* verification: still 200, with
-`"ok": false` and the break described in `problems` (verification stops at
-the first break, so it lists at most one). Only "could not verify at all"
-is an error status.
+A found chain break is a *successful* verification: still 200, with `"ok": false` and the break described in `problems` (verification stops at the first break, so it lists at most one). Only "could not verify at all" is an error status.
 
 **Periodic** — add a `verify` section to the config:
 
@@ -391,48 +305,28 @@ is an error status.
 "verify": { "interval_secs": 86400 }
 ```
 
-One pass runs at startup, then one per interval. A pass that finds a break —
-or cannot run — logs at `error` level; point your alerting at that line.
-Omit the section to disable (the endpoint works either way).
+One pass runs at startup, then one per interval. A pass that finds a break — or can't run — logs at `error` level; point your alerting at that line. Omit the section to disable (the endpoint works either way).
 
 Two things to know before pointing a cron at it:
 
-- At most one verification runs at a time, shared between the endpoint and
-  the periodic task: the endpoint answers **409** while one is running, the
-  periodic task skips its tick with a warning.
-- Verification re-reads every segment **on the writer thread** (the chains
-  live under the store's single-writer lock). While it runs, appends queue
-  up in the bounded pipeline queue instead of being persisted — fine for
-  typical stores, but on a very large store under heavy write load, schedule
-  it off-peak or expect some 503s on `POST /v1/logs` during the pass.
+- At most one verification runs at a time, shared between the endpoint and the periodic task. The endpoint answers **409** while one is running; the periodic task skips its tick with a warning.
+- Verification re-reads every segment **on the writer thread** (the chains live under the store's single-writer lock). While it runs, appends queue up in the bounded pipeline queue instead of being persisted. That's fine for typical stores, but on a very large store under heavy write load, schedule it off-peak or expect some 503s on `POST /v1/logs` during the pass.
 
 ## Health
 
-`GET /v1/healthz` (no token) answers
-`{"status": "ok"|"degraded"|"unhealthy", "reasons": [...]}`:
+`GET /v1/healthz` (no token) answers `{"status": "ok"|"degraded"|"unhealthy", "reasons": [...]}`:
 
-- **`unhealthy`** (HTTP **503**) — events are *not* being persisted:
-  the writer thread is dead, the disk-full latch is set,
-  or a probe write into the store root just failed.
-- **`degraded`** (HTTP **200**) — writes still work, but free disk space is
-  below the `health` thresholds. 200 on purpose: a load balancer must not
-  eject an instance that is still persisting events; the body carries the
-  warning for monitoring to alert on.
+- **`unhealthy`** (HTTP **503**) — events are *not* being persisted: the writer thread is dead, the disk-full latch is set, or a probe write into the store root just failed.
+- **`degraded`** (HTTP **200**) — writes still work, but free disk space is below the `health` thresholds. 200 on purpose: a load balancer must not eject an instance that's still persisting events. The body carries the warning for monitoring to alert on.
 - **`ok`** (HTTP **200**).
 
-Each check runs live per request: writer liveness and the disk-full latch
-from the pipeline, plus an actual create-write-fsync-delete probe in the
-store root and a fresh free-space measurement.
+Each check runs live per request: writer liveness and the disk-full latch from the pipeline, plus an actual create-write-fsync-delete probe in the store root and a fresh free-space measurement.
 
-> Compatibility: before v0.2 this endpoint returned plain-text `ok`
-> unconditionally. Monitors matching on the body must switch to the status
-> code or the JSON `status` field.
+> Compatibility: before v0.2 this endpoint returned plain-text `ok` unconditionally. Monitors matching on the body must switch to the status code or the JSON `status` field.
 
 ## Metrics
 
-`GET /metrics` renders Prometheus text format (v0.0.4). It sits behind a
-bearer token with `administer`, like the rest of the operational surface —
-give Prometheus its own token:
+`GET /metrics` renders Prometheus text format (v0.0.4). It sits behind a bearer token with `administer`, like the rest of the operational surface — give Prometheus its own token:
 
 ```yaml
 scrape_configs:
@@ -458,52 +352,26 @@ scrape_configs:
 | `quipu_disk_low` | gauge | 1 while free space is below the warning thresholds |
 | `quipu_verify_runs_total` | counter | completed integrity verification passes |
 
-Alerting starter pack: page on `quipu_writer_alive == 0`, `quipu_disk_full
-== 1` or `rate(quipu_events_lost_total[5m]) > 0`; warn on `quipu_dlq_entries
-> 0` for more than a few minutes, `quipu_disk_low == 1`, or a growing
-`quipu_queue_depth`.
+Alerting starter pack: page on `quipu_writer_alive == 0`, `quipu_disk_full == 1`, or `rate(quipu_events_lost_total[5m]) > 0`. Warn on `quipu_dlq_entries > 0` for more than a few minutes, `quipu_disk_low == 1`, or a growing `quipu_queue_depth`.
 
 ## Disk-full behaviour
 
-What happens when the volume under the store root fills up is defined, not
-emergent:
+What happens when the volume under the store root fills up is defined, not left to chance:
 
-1. **Early warning.** Every housekeeping interval (30s) the pipeline
-   measures free space. Crossing below the `health` thresholds logs a
-   `warn`, notifies the fallback hook once, flips `quipu_disk_low` to 1 and
-   turns `/v1/healthz` `degraded`. This is the moment to act — grow the
-   volume, lower `retention_max_bytes`, or run `POST /v1/admin/retention`.
-2. **ENOSPC.** A write that fails with "no space left on device" skips the
-   retry/backoff loop entirely (the condition is persistent; rewriting the
-   same bytes cannot succeed) and goes straight to the DLQ — which usually
-   sits on the same full disk and also fails, so the event reaches the
-   fallback hook and `quipu_events_lost_total`. The disk-full latch is set:
-   `quipu_disk_full` reads 1 and `/v1/healthz` answers 503.
-3. **Fast reject (opt-in).** With `health.reject_emit_when_disk_full` set,
-   `POST /v1/logs` answers **507** immediately while the latch is set,
-   instead of queueing events that are bound for the fallback hook anyway —
-   callers get backpressure they can act on.
-4. **Recovery is automatic.** The latch clears as soon as a write succeeds
-   again, or when housekeeping measures free space back above the warning
-   thresholds. No restart, no manual reset.
+1. **Early warning.** Every housekeeping interval (30s) the pipeline measures free space. Crossing below the `health` thresholds logs a `warn`, notifies the fallback hook once, flips `quipu_disk_low` to 1, and turns `/v1/healthz` `degraded`. This is the moment to act: grow the volume, lower `retention_max_bytes`, or run `POST /v1/admin/retention`.
+2. **ENOSPC.** A write that fails with "no space left on device" skips the retry/backoff loop entirely — the condition is persistent, so rewriting the same bytes can't succeed — and goes straight to the DLQ. The DLQ usually sits on the same full disk and also fails, so the event reaches the fallback hook and `quipu_events_lost_total`. The disk-full latch is set: `quipu_disk_full` reads 1 and `/v1/healthz` answers 503.
+3. **Fast reject (opt-in).** With `health.reject_emit_when_disk_full` set, `POST /v1/logs` answers **507** immediately while the latch is set, instead of queueing events that are bound for the fallback hook anyway. Callers get backpressure they can act on.
+4. **Recovery is automatic.** The latch clears as soon as a write succeeds again, or when housekeeping measures free space back above the warning thresholds. No restart, no manual reset.
 
-The matching *prevention* knob is `retention_max_bytes`: give the store a
-byte budget below the volume size and retention keeps it there by dropping
-the oldest sealed segments — same whole-segment unlink as `retention_days`,
-so integrity verification still passes afterwards.
+The matching *prevention* knob is `retention_max_bytes`: give the store a byte budget below the volume size and retention holds it there by dropping the oldest sealed segments — the same whole-segment unlink as `retention_days`, so integrity verification still passes afterward.
 
 ## Availability and recovery
 
-The daemon is a single process by design (see the
-[root README's scope section](../../README.md#availability-and-scope-a-single-node-on-purpose)):
-one writer is what keeps the store to one file lock and one unbroken hash chain.
-That makes the daemon a single point of availability — while it is down, callers' audit trails stall —
-so the project solves availability at the *client*, not by replicating the chain.
+The daemon is a single process by design (see the [root README's scope section](../../README.md#why-no-distributed-storage)): one writer is what keeps the store to one file lock and one unbroken hash chain. That makes the daemon a single point of availability — while it's down, callers' audit trails stall — so the project solves availability at the *client*, not by replicating the chain.
 
 ### Idempotent appends
 
-`POST /v1/logs` accepts an `Idempotency-Key` header (any opaque 1–128 char visible-ASCII
-string; a UUIDv4 is the recommended shape):
+`POST /v1/logs` accepts an `Idempotency-Key` header (any opaque 1–128 char visible-ASCII string; a UUIDv4 is the recommended shape):
 
 ```sh
 curl -s -X POST localhost:7700/v1/logs \
@@ -512,66 +380,36 @@ curl -s -X POST localhost:7700/v1/logs \
   -H 'Content-Type: application/json' -d '{ ... }'
 ```
 
-The server remembers recently accepted keys (config `"idempotency": { "window": 65536 }`;
-in memory, forgotten on restart) and answers a repeat with `202 {"status":"duplicate"}` instead of
-recording a second event. This is what makes a client safe to retry a request it could not
-confirm — a timeout cannot tell "queued" from "lost". The window is in memory by design: a
-retransmission that straddles a server restart can record twice, but both copies carry the same
-client-set `occurred_at`, so the duplicate is detectable after the fact.
+The server remembers recently accepted keys (config `"idempotency": { "window": 65536 }`; in memory, forgotten on restart) and answers a repeat with `202 {"status":"duplicate"}` instead of recording a second event. This is what makes a client safe to retry a request it couldn't confirm — a timeout can't tell "queued" from "lost".
 
-A retry that straddles a restart is the only duplicate path; the bound is deliberate, not a gap.
+The window is in memory by design. A retransmission that straddles a server restart can record twice, but both copies carry the same client-set `occurred_at`, so the duplicate is detectable after the fact. That restart case is the only duplicate path.
 
 ### Cold-standby failover
 
-Recover from a failed or stopped node by cold standby, not live failover (there is no second
-writer to fail over *to* — that is the point of the single-chain design):
+Recover from a failed or stopped node by cold standby, not live failover. There's no second writer to fail over *to* — that's the point of the single-chain design.
 
-1. **Quiesce the active node** if it is still up: send `SIGINT`/`SIGTERM` for a clean shutdown
-   (final fsync), or call `POST /v1/admin/flush` to push the active segment and registry tail to
-   disk. Sealed segments are already immutable and safe to copy at any time; this step only settles
-   the *active* tail.
-2. **Copy the store root** to the standby host (`rsync`, snapshot, restore from backup — see the
-   root README's export/backup notes). Because sealed segments never change, an incremental copy
-   only moves the active tail.
-3. **Start the daemon on the standby** against the copied root. On open it takes the `LOCK` file,
-   truncates any torn tail left by an unclean stop (CRC-framed, so a half-written record is dropped,
-   never misread), and is writable again.
-4. **Repoint clients** (DNS/load-balancer) at the standby. Clients running `quipu-client` held
-   their events in the local spool through the gap and replay them on the next `drain_spool`; the
-   idempotency keys make a replay of anything the old node already accepted a no-op.
+1. **Quiesce the active node** if it's still up: send `SIGINT`/`SIGTERM` for a clean shutdown (final fsync), or call `POST /v1/admin/flush` to push the active segment and registry tail to disk. Sealed segments are already immutable and safe to copy anytime; this step only settles the *active* tail.
+2. **Copy the store root** to the standby host (`rsync`, snapshot, or restore from backup — see the root README's export/backup notes). Because sealed segments never change, an incremental copy only moves the active tail.
+3. **Start the daemon on the standby** against the copied root. On open it takes the `LOCK` file, truncates any torn tail left by an unclean stop (CRC-framed, so a half-written record is dropped, never misread), and is writable again.
+4. **Repoint clients** (DNS / load balancer) at the standby. Clients running `quipu-client` held their events in the local spool through the gap and replay them on the next `drain_spool`; the idempotency keys make a replay of anything the old node already accepted a no-op.
 
-Restart time is bounded by the size of the **active** segment plus the registry replay, not the
-whole store: sealed segments are never rescanned on open. Keeping `max_segment_bytes` modest keeps
-that tail — and therefore failover — fast.
+Restart time is bounded by the size of the **active** segment plus the registry replay, not the whole store — sealed segments are never rescanned on open. Keeping `max_segment_bytes` modest keeps that tail, and therefore failover, fast.
 
 ### SIEM forwarding
 
-Mirror every durably-written event to a syslog collector (RFC 5424 over UDP) by adding a `sink`
-section:
+Mirror every durably-written event to a syslog collector (RFC 5424 over UDP) by adding a `sink` section:
 
 ```json
 "sink": { "syslog_udp": "10.0.0.5:514", "app_name": "quipu-server", "queue_capacity": 16384 }
 ```
 
-Each accepted event becomes one syslog line whose message is a compact JSON summary —
-log id, actor, method, url, target ids, custom-column keys. The event **`content` is not
-forwarded**: it can be large or hold protected values, and the store is the system of record;
-the SIEM gets the audit-trail skeleton. The mirror is **best-effort and never back-pressures
-writes**: a dedicated thread owns the socket, the writer thread only does a non-blocking enqueue,
-and a full backlog drops lines (counted, logged sparsely) rather than stalling persistence. It
-fires on success only — a DLQ-parked event is not mirrored.
+Each accepted event becomes one syslog line whose message is a compact JSON summary: log id, actor, method, url, target ids, custom-column keys. The event **`content` is not forwarded** — it can be large or hold protected values, and the store is the system of record, so the SIEM gets the audit-trail skeleton.
 
-Syslog is the one sink the daemon ships (no extra dependency). A webhook/Kafka/other sink is the
-same shape — a `quipu_middleware::SinkFn` closure — for embedded users who run the pipeline
-directly.
+The mirror is **best-effort and never back-pressures writes**: a dedicated thread owns the socket, the writer thread only does a non-blocking enqueue, and a full backlog drops lines (counted, logged sparsely) rather than stalling persistence. It fires on success only — a DLQ-parked event isn't mirrored.
+
+Syslog is the one sink the daemon ships (no extra dependency). A webhook / Kafka / other sink is the same shape — a `quipu_middleware::SinkFn` closure — for embedded users who run the pipeline directly.
 
 ## Limits (v1, by design)
 
-- One store, one tenant:
-  tokens separate *capabilities* (emit/query/admin), not data —
-  every reader sees every log.
-  Per-tenant isolation would mean per-tenant store roots and is future work.
-- The reference client ([`quipu-client`](../quipu-client/README.md)) carries the
-  retransmission/spool protocol but no transport;
-  the API is small enough to call from any HTTP client,
-  which is the point of choosing JSON over gRPC.
+- One store, one tenant: tokens separate *capabilities* (emit/query/admin), not data — every reader sees every log. Per-tenant isolation would mean per-tenant store roots, and is future work.
+- The reference client ([`quipu-client`](../quipu-client/README.md)) carries the retransmission/spool protocol but no transport. The API is small enough to call from any HTTP client, which is why it's JSON and not gRPC.
